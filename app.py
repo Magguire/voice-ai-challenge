@@ -31,13 +31,20 @@ and may separately reference another member.
 
 CRITICAL RULES:
 - Only extract information explicitly stated. Do NOT infer or guess missing values.
-- If no amount is mentioned, amount must be null — never 0, never invented.
+- If no amount is mentioned, amount must be null — never 0, never invented, never a small placeholder number.
 - If the speaker uses future tense (e.g. "nitatuma" / "I will send") without saying they already paid, this is NOT a completed deposit.
+- Vague quantity words (e.g. "kidogo" / "a little" / "some") are NOT numbers. Never convert them into a numeric guess.
 - referenced_member must be an actual person's name, never a number or group description. If none, use "none".
 
-Example:
+Example 1:
 Transcript: "Nimechelewa mwezi huu lakini nitatuma kiasi chote Ijumaa ijayo."
 Correct extraction: {{"speaker_action": "late_payment_note", "amount": null, "referenced_member": "none", "referenced_member_context": "none", "action_type": "late_payment_note"}}
+(Reasoning: "nimechelewa" = I am late; "nitatuma" = I will send, future tense, not yet paid; no amount stated.)
+
+Example 2:
+Transcript: "Nimetuma pesa kidogo leo."
+Correct extraction: {{"speaker_action": "deposit", "amount": null, "referenced_member": "none", "referenced_member_context": "none", "action_type": "deposit"}}
+(Reasoning: "kidogo" means "a little/some" — a vague qualifier, not a specific number. Never convert vague quantity words into a numeric guess.)
 
 Now extract from this transcript:
 Transcript: "{transcript}"
@@ -50,6 +57,7 @@ Extract exactly these five fields as JSON:
 - action_type: one of "deposit", "payout", "late_payment_note", "membership_update", "other"
 
 Respond with ONLY valid JSON, no other text."""
+
     response = groq_client.chat.completions.create(
         model="llama-3.1-8b-instant",
         messages=[{"role": "user", "content": prompt}],
@@ -57,6 +65,7 @@ Respond with ONLY valid JSON, no other text."""
         response_format={"type": "json_object"}
     )
     return json.loads(response.choices[0].message.content)
+
 
 def generate_tts(text, voice_accent="swahili", voice_gender="female", voice_language="en"):
     url = "https://infer.voice.intron.io/tts/v1/generate"

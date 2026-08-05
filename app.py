@@ -621,7 +621,7 @@ if page == "Record & Query":
 
     st.divider()
     st.subheader("Session Ledger")
-    st.dataframe(st.session_state.ledger, use_container_width=True)
+    st.dataframe(st.session_state.ledger, width='stretch')
 
 # ============================================================
 # PAGE 2: Dashboard
@@ -662,14 +662,14 @@ elif page == "Dashboard":
              "Last paid": v["last_paid"], "Owed": v["owed"], "Loan eligible": v["loan_eligible"]}
             for name, v in MOCK_MEMBERS.items()
         ])
-        st.dataframe(member_df, use_container_width=True, hide_index=True)
+        st.dataframe(member_df, width='stretch', hide_index=True)
 
         st.subheader("Payout rotation order")
         rotation_df = pd.DataFrame([
             {"Position": v["payout_position"], "Member": name, "Scheduled Date": st.session_state.payout_schedule[v["payout_position"]].strftime("%d/%m/%Y")}
             for name, v in MOCK_MEMBERS.items()
         ]).sort_values("Position")
-        st.dataframe(rotation_df, use_container_width=True, hide_index=True)
+        st.dataframe(rotation_df, width='stretch', hide_index=True)
 
         st.subheader("Loan requests")
         tab_pending, tab_approved, tab_rejected = st.tabs(["Pending", "Approved", "Rejected"])
@@ -711,14 +711,14 @@ elif page == "Dashboard":
             if not approved:
                 st.info("No approved loan requests yet.")
             else:
-                st.dataframe(pd.DataFrame(approved), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(approved), width='stretch', hide_index=True)
 
         with tab_rejected:
             rejected = [lr for lr in st.session_state.loan_requests if lr["status"] == "rejected"]
             if not rejected:
                 st.info("No rejected loan requests.")
             else:
-                st.dataframe(pd.DataFrame(rejected), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(rejected), width='stretch', hide_index=True)
 
         st.subheader("Scheduled payment reminders")
         st.caption("Members' self-reported commitments to pay late — for tracking, not enforcement.")
@@ -730,7 +730,7 @@ elif page == "Dashboard":
             display_df = reminders_df[["member", "Amount", "category", "date", "time", "status"]].rename(columns={
                 "member": "Member", "category": "Type", "date": "Date", "time": "Time", "status": "Status"
             })
-            st.dataframe(display_df, use_container_width=True, hide_index=True)
+            st.dataframe(display_df, width='stretch', hide_index=True)
 
     else:
         my_data = MOCK_MEMBERS.get(CURRENT_USER, {})
@@ -758,7 +758,7 @@ elif page == "Dashboard":
         if not my_loans:
             st.info("No loan requests yet.")
         else:
-            st.dataframe(pd.DataFrame(my_loans), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(my_loans), width='stretch', hide_index=True)
 
 # ============================================================
 # PAGE 3: Benchmark
@@ -804,7 +804,7 @@ elif page == "Benchmark":
                 {"Model": "Whisper", "Transcript": entry["whisper"], "Word Accuracy": f"{whisper_acc}%"},
                 {"Model": "MMS", "Transcript": entry["mms"], "Word Accuracy": f"{mms_acc}%"},
             ])
-            st.dataframe(comp_df, use_container_width=True, hide_index=True)
+            st.dataframe(comp_df, width='stretch', hide_index=True)
             st.divider()
 
         st.subheader("Average accuracy across all recordings")

@@ -89,6 +89,8 @@ NUMBER_WORDS = [
 
 SCALE_WORDS = ["elfu", "mia", "thousand", "hundred", "milioni", "million"]
 
+VALID_SPEAKER_ACTIONS = {"deposit", "payout_received", "late_payment_note", "membership_update", "other"}
+
 def validate_extraction(transcript, extracted):
     if extracted.get("amount") is not None:
         transcript_lower = transcript.lower()

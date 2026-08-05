@@ -141,8 +141,8 @@ def generate_confirmation_text(entry):
 
 
 # --- UI ---
-st.set_page_config(page_title="Chama Voice Agent", page_icon="🎙️", layout="wide")
-st.title("🎙️ HabaHub")
+st.set_page_config(page_title="Chama Voice Agent", page_icon="🎙️")
+st.title("🎙️ Chama Voice Agent")
 st.write("Speak your contribution, payout note, or update in English, Swahili, or both.")
 
 if "ledger" not in st.session_state:

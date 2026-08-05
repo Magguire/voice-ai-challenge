@@ -256,7 +256,7 @@ if page == "Record & Query":
     render_header("Record & Query")
     st.write("Speak a contribution, payment note, update — or ask a question about your account — in English, Swahili, or both.")
     audio = st.audio_input("Record your message")
-    
+
 
     if audio is not None:
         with open("temp_input.wav", "wb") as f:
@@ -265,6 +265,23 @@ if page == "Record & Query":
         with st.spinner("Transcribing..."):
             transcript = transcribe_sahara("temp_input.wav")
         st.write("**Transcript:**", transcript)
+
+        with st.spinner("Running benchmark comparison..."):
+            try:
+                whisper_result = transcribe_whisper_hf("temp_input.wav")
+            except Exception as e:
+                whisper_result = f"[failed: {e}]"
+            try:
+                mms_result = transcribe_mms("temp_input.wav")
+            except Exception as e:
+                mms_result = f"[failed: {e}]"
+
+        st.session_state.benchmark_results.append({
+            "ground_truth": transcript,
+            "sahara": transcript,
+            "whisper": whisper_result,
+            "mms": mms_result
+        })
 
         with st.spinner("Understanding your message..."):
             intent = classify_intent(transcript)

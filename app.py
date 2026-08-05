@@ -177,8 +177,9 @@ if audio is not None:
     with st.spinner("Extracting details..."):
         extracted_raw = extract_chama_action(transcript)
         extracted = json.loads(extracted_raw) if isinstance(extracted_raw, str) else extracted_raw
+        st.json(extracted)  # shows raw extraction including reasoning, before validation strips it
         extracted = validate_extraction(transcript, extracted)
-
+        
     if needs_confirmation(extracted):
         st.session_state.pending_confirmation = extracted
         st.warning("This message was unclear.")
@@ -207,6 +208,7 @@ if st.session_state.pending_confirmation is not None:
             reply_transcript = transcribe_sahara("temp_reply.wav")
             reply_extracted_raw = extract_chama_action(reply_transcript)
             reply_extracted = json.loads(reply_extracted_raw) if isinstance(reply_extracted_raw, str) else reply_extracted_raw
+            st.json(reply_extracted)  # same visibility for the reply path
             reply_extracted = validate_extraction(reply_transcript, reply_extracted)
 
         st.write("**Reply transcript:**", reply_transcript)

@@ -7,7 +7,6 @@ import pandas as pd
 import torch
 import string
 
-# --- Load keys from Streamlit secrets ---
 SAHARA_API_KEY = st.secrets["SAHARA_API_KEY"]
 GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
 HF_API_KEY = st.secrets.get("HF_API_KEY")
@@ -27,7 +26,6 @@ VALID_SPEAKER_ACTIONS = {"deposit", "payout_received", "initiate_payout", "late_
 ADMIN_ALLOWED_ACTIONS = VALID_SPEAKER_ACTIONS
 MEMBER_ALLOWED_ACTIONS = {"deposit", "payout_received", "late_payment_note", "loan_request", "other"}
 
-# --- Users (demo-only switcher, not real authentication) ---
 USERS = {
     "Wendo": {"role": "admin"},
     "Juma": {"role": "member"},
@@ -39,7 +37,6 @@ if "current_user_name" not in st.session_state:
 CURRENT_USER = st.session_state.current_user_name
 IS_ADMIN = USERS[CURRENT_USER]["role"] == "admin"
 
-# --- Mock chama data (clearly illustrative, not real transaction history) ---
 MOCK_MEMBERS = {
     "Wendo":  {"ytd_contributed": 24000, "this_month_paid": True,  "last_paid": "2026-08-01", "owed": 0,     "loan_eligible": 20000, "payout_position": 3},
     "Grace":  {"ytd_contributed": 22000, "this_month_paid": True,  "last_paid": "2026-08-02", "owed": 0,     "loan_eligible": 18000, "payout_position": 1},
@@ -54,7 +51,7 @@ MOCK_MONTHLY_TOTALS = pd.DataFrame({
     "Collected": [18000, 19500, 21000, 20500, 22000, 21000]
 })
 
-CURRENT_PAYOUT_POSITION = 3  # mock: whose turn it is this month
+CURRENT_PAYOUT_POSITION = 3
 
 
 def transcribe_sahara(audio_path, language="sw"):
@@ -100,8 +97,14 @@ def transcribe_mms(audio_path):
 
 
 def classify_intent(transcript):
-    prompt = f"""Classify this chama voice message as either "statement" (reporting an action, like a deposit or payment)
-or "question" (asking for information, like account status, balance, loan eligibility, or payout timing).
+    prompt = f"""Classify this chama voice message as either "statement" or "question".
+
+"statement" includes: reporting a completed or future action (deposit, payment), requesting a loan
+(e.g. "I want to borrow...", "Naomba mkopo..."), requesting a payout be sent, or any message where the
+speaker wants an action taken or recorded — even if phrased politely as a request.
+
+"question" is ONLY for messages purely seeking information with no action requested
+(e.g. "When is my turn?", "How much do I owe?", "Nimechangia kiasi gani?").
 
 Transcript: "{transcript}"
 
@@ -209,7 +212,6 @@ def validate_extraction(transcript, extracted):
 
 
 def check_payout_eligibility(member_name, amount):
-    """Simulated eligibility check — no real payment is ever sent."""
     member = MOCK_MEMBERS.get(member_name)
     if not member:
         return False, f"{member_name} is not a registered member."
@@ -219,7 +221,6 @@ def check_payout_eligibility(member_name, amount):
 
 
 def check_loan_eligibility(member_name, amount):
-    """Simulated loan eligibility check against mock loan_eligible cap."""
     member = MOCK_MEMBERS.get(member_name)
     if not member:
         return False, f"{member_name} is not a registered member."
@@ -244,7 +245,7 @@ def generate_confirmation_text(entry):
     elif entry["speaker_action"] == "initiate_payout":
         text = f"Processing payout request for {entry['referenced_member']}."
     elif entry["speaker_action"] == "loan_request":
-        text = f"Loan request of {entry['amount']} logged, pending admin approval."
+        text = f"Loan request of {entry['amount']} recorded, pending admin approval."
     elif entry["speaker_action"] == "late_payment_note":
         text = "Noted: you'll be sending your payment late. No amount logged yet."
     elif entry["speaker_action"] == "membership_update":
@@ -270,22 +271,17 @@ def word_accuracy(ground_truth, model_output):
     return round((correct / len(gt_words)) * 100, 1)
 
 
-# --- Page config ---
 st.set_page_config(page_title="Habahub", page_icon="🎙️", layout="wide")
 
 if "ledger" not in st.session_state:
     st.session_state.ledger = []
-
 if "benchmark_results" not in st.session_state:
     st.session_state.benchmark_results = []
-
 if "last_processed_audio_id" not in st.session_state:
     st.session_state.last_processed_audio_id = None
-
 if "loan_requests" not in st.session_state:
     st.session_state.loan_requests = []
 
-# --- Sidebar ---
 st.sidebar.title("🎙️ Habahub")
 st.sidebar.markdown(f"**{CURRENT_USER}** ({'Admin' if IS_ADMIN else 'Member'})")
 st.sidebar.divider()
@@ -424,13 +420,6 @@ if page == "Record & Query":
 
                     confirmation_text = generate_confirmation_text(final_entry)
 
-                    if edited_speaker_action == "loan_request":
-                        st.session_state.loan_requests.append({
-                            "member": speaking_as,
-                            "amount": final_entry["amount"],
-                            "status": "pending"
-                        })
-
                     if edited_speaker_action == "initiate_payout" and IS_ADMIN and edited_referenced_member not in ("none", ""):
                         eligible, elig_message = check_payout_eligibility(edited_referenced_member, edited_amount)
                         ai_action_taken = True
@@ -442,12 +431,37 @@ if page == "Record & Query":
                             confirmation_text += f" Payment blocked. {elig_message}"
 
                     final_entry["ai_action_taken"] = ai_action_taken
-
                     st.session_state.ledger.append(final_entry)
+
+                    if edited_speaker_action == "loan_request":
+                        st.session_state.pending_loan_review = {
+                            "member": speaking_as,
+                            "amount": edited_amount
+                        }
+
                     with st.spinner("Generating spoken confirmation..."):
                         audio_url = generate_tts(confirmation_text)
                     st.write("**Confirmation:**", confirmation_text)
                     st.audio(audio_url)
+
+            if "pending_loan_review" in st.session_state and st.session_state.pending_loan_review:
+                st.divider()
+                st.subheader("Confirm loan request")
+                lr = st.session_state.pending_loan_review
+                st.write(f"Requesting **{lr['amount']}** on behalf of **{lr['member']}**.")
+                col1, col2 = st.columns(2)
+                if col1.button("Submit to admin for approval"):
+                    st.session_state.loan_requests.append({
+                        "member": lr["member"],
+                        "amount": lr["amount"],
+                        "status": "pending"
+                    })
+                    st.success("✅ Loan request submitted to admin for approval.")
+                    st.session_state.pending_loan_review = None
+                    st.rerun()
+                if col2.button("Cancel request"):
+                    st.session_state.pending_loan_review = None
+                    st.rerun()
 
     st.divider()
     st.subheader("Session Ledger")
@@ -550,6 +564,8 @@ elif page == "Benchmark":
     if not st.session_state.benchmark_results:
         st.info("No recordings yet — use Record & Query to generate benchmark data.")
     else:
+        all_sahara, all_whisper, all_mms = [], [], []
+
         for i, entry in enumerate(st.session_state.benchmark_results):
             st.markdown(f"**Recording {i+1}**")
 
@@ -573,6 +589,10 @@ elif page == "Benchmark":
             whisper_acc = word_accuracy(applied_gt, entry["whisper"])
             mms_acc = word_accuracy(applied_gt, entry["mms"])
 
+            all_sahara.append(sahara_acc)
+            all_whisper.append(whisper_acc)
+            all_mms.append(mms_acc)
+
             comp_df = pd.DataFrame([
                 {"Model": "Sahara", "Transcript": entry["sahara"], "Word Accuracy": f"{sahara_acc}%"},
                 {"Model": "Whisper", "Transcript": entry["whisper"], "Word Accuracy": f"{whisper_acc}%"},
@@ -580,3 +600,9 @@ elif page == "Benchmark":
             ])
             st.dataframe(comp_df, use_container_width=True, hide_index=True)
             st.divider()
+
+        st.subheader("Average accuracy across all recordings")
+        avg_col1, avg_col2, avg_col3 = st.columns(3)
+        avg_col1.metric("Sahara avg", f"{round(sum(all_sahara)/len(all_sahara), 1)}%")
+        avg_col2.metric("Whisper avg", f"{round(sum(all_whisper)/len(all_whisper), 1)}%")
+        avg_col3.metric("MMS avg", f"{round(sum(all_mms)/len(all_mms), 1)}%")

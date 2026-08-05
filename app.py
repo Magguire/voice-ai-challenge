@@ -7,7 +7,7 @@ import pandas as pd
 import torch
 import string
 import calendar
-from datetime import date
+from datetime import date, timedelta
 
 SAHARA_API_KEY = st.secrets["SAHARA_API_KEY"]
 GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
@@ -61,7 +61,10 @@ MOCK_MEMBER_MONTHLY = {
 }
 
 SCHEDULE_START_YEAR = 2026
-SCHEDULE_START_MONTH = 8  # payouts begin at end of August 2026
+SCHEDULE_START_MONTH = 8
+
+REAL_TODAY = date.today()
+CURRENT_MONTH_INDEX = REAL_TODAY.month
 
 
 def get_member_by_position(position):
@@ -72,7 +75,6 @@ def get_member_by_position(position):
 
 
 def compute_date_for_offset(offset_months):
-    """Given an offset from the schedule start, return the last day of that month as a date object."""
     month_index = SCHEDULE_START_MONTH - 1 + offset_months
     year = SCHEDULE_START_YEAR + month_index // 12
     month = month_index % 12 + 1
@@ -86,6 +88,14 @@ def build_initial_schedule():
     schedule[1] = date.today()  # override: position 1's payout is due today, for demo purposes
     return schedule
 
+
+def get_next_friday(from_date):
+    days_ahead = 4 - from_date.weekday()
+    if days_ahead <= 0:
+        days_ahead += 7
+    return from_date + timedelta(days=days_ahead)
+
+
 if "payout_schedule" not in st.session_state:
     st.session_state.payout_schedule = build_initial_schedule()
 
@@ -94,6 +104,9 @@ if "payouts_made_positions" not in st.session_state:
 
 if "simulated_today" not in st.session_state:
     st.session_state.simulated_today = date.today()
+
+if "scheduled_reminders" not in st.session_state:
+    st.session_state.scheduled_reminders = []
 
 
 def get_pending_loan_for_member(member_name):
@@ -185,7 +198,7 @@ Give a short, direct spoken-style answer (1-2 sentences)."""
     return response.choices[0].message.content
 
 
-def extract_chama_action(transcript):
+def extract_chama_action(transcript, speaker_name):
     if not transcript or len(transcript.strip()) < 5:
         return json.dumps({
             "reasoning": "Transcript empty or too short to contain meaningful speech.",
@@ -193,8 +206,13 @@ def extract_chama_action(transcript):
             "referenced_member": "none", "referenced_member_context": "none", "action_type": "other"
         })
     prompt = f"""You are extracting structured data from a chama (savings group) voice message.
-The message may mix English and Swahili. The speaker is usually reporting their own action,
-and may separately reference another member.
+The message may mix English and Swahili.
+
+IMPORTANT: The person speaking this message is logged in as "{speaker_name}". This is a known fact,
+not something to guess. If the speaker mentions another person's name (e.g. "Juma", "Grace"), that
+name refers to a DIFFERENT person than {speaker_name}, never to the speaker themselves — even if the
+sentence is a command or approval naming that other person. Only treat an action as about {speaker_name}
+if the speaker uses first-person language ("mimi", "yangu", "I", "my") or names no one else.
 
 CRITICAL RULES:
 - Only extract information explicitly stated. Do NOT infer or guess missing values.
@@ -202,10 +220,10 @@ CRITICAL RULES:
 - Amounts may be stated as digits (e.g. "2000") or as words (e.g. "elfu mbili" / "two thousand"). Both are valid.
 - If the speaker uses future tense (e.g. "nitatuma" / "I will send") without saying they already paid, this is NOT a completed deposit.
 - Vague quantity words (e.g. "kidogo" / "a little" / "some") are NOT numbers. Never convert them into a numeric guess.
-- referenced_member must be an actual person's name, never a number or group description. If none, use "none".
+- referenced_member must be an actual person's name, never a number or group description, and never {speaker_name} unless {speaker_name} refers to themselves. If none, use "none".
 - If the speaker is COMMANDING a regular scheduled payout be sent to a member (e.g. "Tuma X kwa Y"), this is "initiate_scheduled_payout".
 - If the speaker is asking to BORROW money for themselves, this is "loan_request".
-- If the speaker (an admin) is APPROVING or releasing an already-requested loan payout for another member (e.g. "Approve mkopo wa Juma", "Send Juma's loan"), this is "initiate_loan_payout" — distinct from a scheduled payout.
+- If the speaker (an admin) is APPROVING or releasing an already-requested loan payout for another member (e.g. "Approve mkopo wa Juma", "Send Juma's loan"), this is "initiate_loan_payout", and referenced_member is that OTHER member, not {speaker_name}.
 
 Example 1:
 Transcript: "Nimechelewa mwezi huu lakini nitatuma kiasi chote Ijumaa ijayo."
@@ -217,21 +235,21 @@ Correct extraction: {{"reasoning": "Speaker completed an action ('nimetuma'). 'K
 
 Example 3:
 Transcript: "Tuma elfu mbili kwa Grace leo."
-Correct extraction: {{"reasoning": "Speaker is issuing a command to send a scheduled payout to another member.", "speaker_action": "initiate_scheduled_payout", "amount": 2000, "referenced_member": "Grace", "referenced_member_context": "payout recipient", "action_type": "payout"}}
+Correct extraction: {{"reasoning": "Speaker is issuing a command to send a scheduled payout to another member, Grace — not the speaker.", "speaker_action": "initiate_scheduled_payout", "amount": 2000, "referenced_member": "Grace", "referenced_member_context": "payout recipient", "action_type": "payout"}}
 
 Example 4:
 Transcript: "Naomba mkopo wa elfu tano."
-Correct extraction: {{"reasoning": "Speaker is requesting to borrow money for themselves from the group.", "speaker_action": "loan_request", "amount": 5000, "referenced_member": "none", "referenced_member_context": "none", "action_type": "other"}}
+Correct extraction: {{"reasoning": "Speaker is requesting to borrow money for themselves from the group. No other member named.", "speaker_action": "loan_request", "amount": 5000, "referenced_member": "none", "referenced_member_context": "none", "action_type": "other"}}
 
 Example 5:
 Transcript: "Approve mkopo wa Juma."
-Correct extraction: {{"reasoning": "Speaker (admin) is approving and releasing an existing loan payout for another member, not a scheduled payout.", "speaker_action": "initiate_loan_payout", "amount": null, "referenced_member": "Juma", "referenced_member_context": "loan payout approval", "action_type": "payout"}}
+Correct extraction: {{"reasoning": "Speaker is approving and releasing an existing loan payout for another member, Juma — the speaker is the admin taking the action, Juma is who it's about, not the speaker.", "speaker_action": "initiate_loan_payout", "amount": null, "referenced_member": "Juma", "referenced_member_context": "loan payout approval", "action_type": "payout"}}
 
-Now extract from this transcript:
+Now extract from this transcript, spoken by {speaker_name}:
 Transcript: "{transcript}"
 
-First, in "reasoning", briefly state: (a) who is speaking, (b) what tense/timing they use,
-(c) whether they personally took a financial action or only mentioned someone else's,
+First, in "reasoning", briefly state: (a) who is speaking (should be {speaker_name}), (b) what tense/timing they use,
+(c) whether they personally took a financial action or are acting on behalf of / referencing someone else,
 (d) whether an amount was stated as digits, as words, or not stated at all.
 Then extract the five fields, matching your reasoning.
 
@@ -267,7 +285,6 @@ def validate_extraction(transcript, extracted):
 
 
 def check_scheduled_payout_eligibility(member_name, amount):
-    """Checks: is it actually this member's scheduled turn, has today reached that date, has it already been paid."""
     member = MOCK_MEMBERS.get(member_name)
     if not member:
         return False, f"{member_name} is not a registered member."
@@ -286,16 +303,13 @@ def check_scheduled_payout_eligibility(member_name, amount):
 
 
 def mark_scheduled_payout_made(member_name):
-    """Marks the payout as made and advances that position's schedule by one full rotation."""
     member = MOCK_MEMBERS.get(member_name)
     position = member["payout_position"]
-    st.session_state.payouts_made_positions.add(position)
     num_members = len(MOCK_MEMBERS)
     old_date = st.session_state.payout_schedule[position]
     old_offset = (old_date.year - SCHEDULE_START_YEAR) * 12 + (old_date.month - SCHEDULE_START_MONTH)
     new_offset = old_offset + num_members
     st.session_state.payout_schedule[position] = compute_date_for_offset(new_offset)
-    st.session_state.payouts_made_positions.discard(position)
 
 
 def check_loan_eligibility(member_name, amount):
@@ -392,6 +406,7 @@ speaking_as = CURRENT_USER
 # ============================================================
 if page == "Record & Query":
     render_header("Record & Query")
+    st.caption(f"Logged in as: {speaking_as}")
     st.write("Speak a contribution, payment note, loan request, or update — or ask a question about your account — in English, Swahili, or both.")
     audio = st.audio_input("Record your message")
 
@@ -432,7 +447,7 @@ if page == "Record & Query":
 
             if intent != "question":
                 with st.spinner("Extracting details..."):
-                    extracted_raw = extract_chama_action(transcript)
+                    extracted_raw = extract_chama_action(transcript, speaking_as)
                     extracted = json.loads(extracted_raw) if isinstance(extracted_raw, str) else extracted_raw
                     extracted = validate_extraction(transcript, extracted)
                 st.session_state.current_extracted = extracted
@@ -539,6 +554,11 @@ if page == "Record & Query":
                             "amount": edited_amount
                         }
 
+                    if edited_speaker_action == "late_payment_note":
+                        st.session_state.show_reminder_offer = True
+                        st.session_state.reminder_offer_member = speaking_as
+                        st.session_state.reminder_offer_amount = final_entry.get("amount")
+
                     with st.spinner("Generating spoken confirmation..."):
                         audio_url = generate_tts(confirmation_text)
                     st.write("**Confirmation:**", confirmation_text)
@@ -563,6 +583,42 @@ if page == "Record & Query":
                     st.session_state.pending_loan_review = None
                     st.rerun()
 
+            if st.session_state.get("show_reminder_offer"):
+                st.divider()
+                next_friday = get_next_friday(st.session_state.simulated_today)
+                st.subheader("📅 Schedule a payment reminder?")
+                st.write(f"Would you like a reminder SMS scheduled for **next Friday, {next_friday.strftime('%d/%m/%Y')} at 9:00 AM**?")
+
+                existing_amount = st.session_state.reminder_offer_amount
+                if existing_amount is None:
+                    st.info("No amount was mentioned in your message — please enter one to schedule the reminder.")
+                reminder_amount = st.number_input(
+                    "Amount owed",
+                    value=float(existing_amount) if existing_amount is not None else 0.0,
+                    min_value=0.0, step=1.0,
+                    key="reminder_amount_input"
+                )
+                reminder_category = st.selectbox("Payment type", ["Monthly Contribution", "Loan"], key="reminder_category_input")
+
+                if st.button("Yes, schedule reminder"):
+                    if reminder_amount <= 0:
+                        st.error("❌ Please enter an amount greater than 0 before scheduling.")
+                    else:
+                        st.session_state.scheduled_reminders.append({
+                            "member": st.session_state.reminder_offer_member,
+                            "amount": reminder_amount,
+                            "category": reminder_category,
+                            "date": next_friday.strftime("%d/%m/%Y"),
+                            "time": "09:00",
+                            "status": "scheduled"
+                        })
+                        st.success(f"✅ SIMULATED — {reminder_category} reminder of {reminder_amount} scheduled for {st.session_state.reminder_offer_member} on {next_friday.strftime('%d/%m/%Y')} at 9:00 AM. No real SMS sent.")
+                        st.session_state.show_reminder_offer = False
+                        st.rerun()
+                if st.button("No thanks"):
+                    st.session_state.show_reminder_offer = False
+                    st.rerun()
+
     st.divider()
     st.subheader("Session Ledger")
     st.dataframe(st.session_state.ledger, use_container_width=True)
@@ -576,15 +632,15 @@ elif page == "Dashboard":
 
     if IS_ADMIN:
         with st.expander("🛠️ Demo controls"):
-            st.caption("Real 'today' is before the first scheduled payout date, so this lets you simulate a later date to demo payout eligibility live. Not a real clock override.")
+            st.caption("Real 'today' is before most scheduled payout dates, so this lets you simulate a later date to demo payout eligibility live. Not a real clock override.")
             new_sim_date = st.date_input("Simulate current date", value=st.session_state.simulated_today)
             if new_sim_date != st.session_state.simulated_today:
                 st.session_state.simulated_today = new_sim_date
                 st.rerun()
 
         total_ytd = sum(m["ytd_contributed"] for m in MOCK_MEMBERS.values())
-        this_month = MOCK_MONTHLY_TOTALS["Collected"].iloc[7]
-        last_month = MOCK_MONTHLY_TOTALS["Collected"].iloc[6]
+        this_month = MOCK_MONTHLY_TOTALS["Collected"].iloc[CURRENT_MONTH_INDEX - 1]
+        last_month = MOCK_MONTHLY_TOTALS["Collected"].iloc[CURRENT_MONTH_INDEX - 2] if CURRENT_MONTH_INDEX >= 2 else 0
         paid_this_month = sum(1 for m in MOCK_MEMBERS.values() if m["this_month_paid"])
 
         col1, col2, col3, col4 = st.columns(4)
@@ -593,9 +649,12 @@ elif page == "Dashboard":
         col3.metric("Members paid this month", f"{paid_this_month}/{len(MOCK_MEMBERS)}")
         col4.metric("Total owed to group", f"KES {sum(m['owed'] for m in MOCK_MEMBERS.values()):,}")
 
-        st.subheader("Monthly collections (Jan–Dec)")
-        st.caption("Future months (Sep–Dec) shown as 0 until recorded.")
-        st.bar_chart(MOCK_MONTHLY_TOTALS.set_index("Month"))
+        st.subheader("Monthly collections (year to date)")
+        months_to_show = MONTHS_FULL[:CURRENT_MONTH_INDEX]
+        collected_to_show = MOCK_MONTHLY_TOTALS["Collected"].tolist()[:CURRENT_MONTH_INDEX]
+        monthly_df = pd.DataFrame({"Month": months_to_show, "Collected": collected_to_show})
+        monthly_df["Month"] = pd.Categorical(monthly_df["Month"], categories=months_to_show, ordered=True)
+        st.bar_chart(monthly_df.set_index("Month"))
 
         st.subheader("Member contributions")
         member_df = pd.DataFrame([
@@ -661,6 +720,18 @@ elif page == "Dashboard":
             else:
                 st.dataframe(pd.DataFrame(rejected), use_container_width=True, hide_index=True)
 
+        st.subheader("Scheduled payment reminders")
+        st.caption("Members' self-reported commitments to pay late — for tracking, not enforcement.")
+        if not st.session_state.scheduled_reminders:
+            st.info("No scheduled reminders yet.")
+        else:
+            reminders_df = pd.DataFrame(st.session_state.scheduled_reminders)
+            reminders_df["Amount"] = reminders_df["amount"].apply(lambda a: f"KES {a:,.0f}" if a else "Not specified")
+            display_df = reminders_df[["member", "Amount", "category", "date", "time", "status"]].rename(columns={
+                "member": "Member", "category": "Type", "date": "Date", "time": "Time", "status": "Status"
+            })
+            st.dataframe(display_df, use_container_width=True, hide_index=True)
+
     else:
         my_data = MOCK_MEMBERS.get(CURRENT_USER, {})
         st.subheader(f"Your account — {CURRENT_USER}")
@@ -675,12 +746,11 @@ elif page == "Dashboard":
         my_date = st.session_state.payout_schedule.get(my_position)
         st.write(f"**Your payout position:** {my_position} (scheduled: {my_date.strftime('%d/%m/%Y') if my_date else 'N/A'})")
 
-        st.subheader("Your monthly contributions")
-        st.caption("Future months (Sep–Dec) shown as 0 until recorded.")
-        my_monthly_df = pd.DataFrame({
-            "Month": MONTHS_FULL,
-            "Contributed": MOCK_MEMBER_MONTHLY.get(CURRENT_USER, [0]*12)
-        })
+        st.subheader("Your monthly contributions (year to date)")
+        months_to_show = MONTHS_FULL[:CURRENT_MONTH_INDEX]
+        my_monthly_values = MOCK_MEMBER_MONTHLY.get(CURRENT_USER, [0]*12)[:CURRENT_MONTH_INDEX]
+        my_monthly_df = pd.DataFrame({"Month": months_to_show, "Contributed": my_monthly_values})
+        my_monthly_df["Month"] = pd.Categorical(my_monthly_df["Month"], categories=months_to_show, ordered=True)
         st.bar_chart(my_monthly_df.set_index("Month"))
 
         st.subheader("Your loan requests")

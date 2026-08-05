@@ -26,28 +26,6 @@ def transcribe_sahara(audio_path, language="sw"):
         raise Exception(f"Sahara returned non-JSON response: {response.text[:300]}")
 
 
-NUMBER_WORDS = [
-    # English
-    "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
-    "hundred", "thousand", "million",
-    # Swahili
-    "moja", "mbili", "tatu", "nne", "tano", "sita", "saba", "nane", "tisa", "kumi",
-    "ishirini", "thelathini", "arobaini", "hamsini", "sitini", "sabini", "themanini", "tisini",
-    "mia", "elfu", "milioni"
-]
-
-def validate_extraction(transcript, extracted):
-    if extracted.get("amount") is not None:
-        transcript_lower = transcript.lower()
-        has_digit = bool(re.search(r'\d', transcript))
-        has_number_word = any(word in transcript_lower for word in NUMBER_WORDS)
-        if not has_digit and not has_number_word:
-            extracted["_original_amount_before_validation"] = extracted["amount"]
-            extracted["amount"] = None
-            extracted["_flag"] = "amount removed: no digit or number word found in transcript"
-    extracted.pop("reasoning", None)  # drop scratchpad before logging to ledger
-    return extracted
-
 def extract_chama_action(transcript):
     prompt = f"""You are extracting structured data from a chama (savings group) voice message.
 The message may mix English and Swahili. The speaker is usually reporting their own action,
@@ -87,6 +65,29 @@ Respond with ONLY valid JSON in this exact structure, no other text:
         response_format={"type": "json_object"}
     )
     return json.loads(response.choices[0].message.content)
+
+
+NUMBER_WORDS = [
+    # English
+    "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
+    "hundred", "thousand", "million",
+    # Swahili
+    "moja", "mbili", "tatu", "nne", "tano", "sita", "saba", "nane", "tisa", "kumi",
+    "ishirini", "thelathini", "arobaini", "hamsini", "sitini", "sabini", "themanini", "tisini",
+    "mia", "elfu", "milioni"
+]
+
+def validate_extraction(transcript, extracted):
+    if extracted.get("amount") is not None:
+        transcript_lower = transcript.lower()
+        has_digit = bool(re.search(r'\d', transcript))
+        has_number_word = any(word in transcript_lower for word in NUMBER_WORDS)
+        if not has_digit and not has_number_word:
+            extracted["_original_amount_before_validation"] = extracted["amount"]
+            extracted["amount"] = None
+            extracted["_flag"] = "amount removed: no digit or number word found in transcript"
+    extracted.pop("reasoning", None)  # drop scratchpad before logging to ledger
+    return extracted
 
 
 def generate_tts(text, voice_accent="swahili", voice_gender="female", voice_language="en"):

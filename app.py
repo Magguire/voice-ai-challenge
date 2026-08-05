@@ -4,10 +4,13 @@ import json
 from groq import Groq
 import re
 import pandas as pd
+import torch
 
 # --- Load keys from Streamlit secrets ---
 SAHARA_API_KEY = st.secrets["SAHARA_API_KEY"]
 GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
+HF_API_KEY = st.secrets.get("HF_API_KEY") # new secret, free HF account + free API token
+
 
 groq_client = Groq(api_key=GROQ_API_KEY)
 
@@ -51,6 +54,38 @@ def transcribe_sahara(audio_path, language="sw"):
         return response.json()["data"]["audio_transcript"]
     except requests.exceptions.JSONDecodeError:
         raise Exception(f"Sahara returned non-JSON response: {response.text[:300]}")
+
+
+
+def transcribe_whisper_hf(audio_path):
+    api_url = "https://api-inference.huggingface.co/models/openai/whisper-small"
+    headers = {"Authorization": f"Bearer {HF_API_KEY}"}
+    with open(audio_path, "rb") as f:
+        data = f.read()
+    response = requests.post(api_url, headers=headers, data=data, timeout=60)
+    if response.status_code != 200:
+        raise Exception(f"HF Whisper API error {response.status_code}: {response.text[:300]}")
+    return response.json().get("text", "")
+
+@st.cache_resource
+def load_mms_model():
+    from transformers import Wav2Vec2ForCTC, AutoProcessor
+    model_id = "facebook/mms-1b-all"
+    processor = AutoProcessor.from_pretrained(model_id, target_lang="swh")
+    model = Wav2Vec2ForCTC.from_pretrained(model_id, target_lang="swh", ignore_mismatched_sizes=True)
+    return processor, model
+
+def transcribe_mms(audio_path):
+    import torchaudio
+    processor, model = load_mms_model()
+    speech, sr = torchaudio.load(audio_path)
+    if sr != 16000:
+        speech = torchaudio.functional.resample(speech, sr, 16000)
+    inputs = processor(speech.squeeze().numpy(), sampling_rate=16000, return_tensors="pt")
+    with torch.no_grad():
+        logits = model(**inputs).logits
+    ids = torch.argmax(logits, dim=-1)[0]
+    return processor.decode(ids)
 
 
 def classify_intent(transcript):
@@ -174,11 +209,25 @@ def generate_confirmation_text(entry):
     return text
 
 
+def word_accuracy(ground_truth, model_output):
+    if not model_output or model_output.startswith("[failed"):
+        return 0.0
+    gt_words = set(ground_truth.lower().split())
+    model_words = set(model_output.lower().split())
+    if not gt_words:
+        return 0.0
+    correct = len(gt_words & model_words)
+    return round((correct / len(gt_words)) * 100, 1)
+
+
 # --- Page config ---
 st.set_page_config(page_title="Habahub", page_icon="🎙️", layout="wide")
 
 if "ledger" not in st.session_state:
     st.session_state.ledger = []
+    
+if "benchmark_results" not in st.session_state:
+    st.session_state.benchmark_results = []
 
 # --- Sidebar ---
 st.sidebar.title("🎙️ Habahub")
@@ -320,38 +369,64 @@ elif page == "Dashboard":
 # ============================================================
 elif page == "Benchmark":
     render_header("Benchmark")
-    st.caption("Comparison across 3 speech models on real code-switched test audio, recorded and evaluated during development.")
+    st.caption("Live results from Record & Query, benchmarked against editable ground truth.")
 
-    BENCHMARK_DATA = [
-        {
-            "Test Case": "testcase1",
-            "Ground Truth": "Nimeweka 2000 leo. That's my deposit ya loan repayment, na next Friday ni zamu ya Grace.",
-            "Sahara": "Nimeweka 2,000 leo. That's my deposit Yelon repayment na next Friday ni za Grace.",
-            "Whisper": "Nimeweka 2000 lewa. That's my deposit, a loan repayment na next Friday nizamu ya grace.",
-            "MMS": "nimeweka 200leo dhat's may dipositi ya lon repayment na next fridey ni zamu ya greece"
-        },
-        {
-            "Test Case": "testcase2",
-            "Ground Truth": "Nimechelewa this month, but nitatuma the full amount next Friday, hiyo iko sawa?",
-            "Sahara": "Nimechelewa mwezi huu lakini nitatuma kiasi chote Ijumaa ijayo. Hiyo iko sawa.",
-            "Whisper": "Imechelewa this month, but nita tumade full amount next Friday. Yoi kusawa.",
-            "MMS": "nimechelewa this month bat nitatuma the fuu la mount next fridey yoo iko sawa"
-        },
-        {
-            "Test Case": "testcase3",
-            "Ground Truth": "Leo tulipata three new members kwenye group, so tuta-adjust rotation kidogo, utapokea payout yako mwezi ujao instead of this month.",
-            "Sahara": "Leo tulipata members 3 wapya kwenye group, so tutafanya rotation kidogo, utapokea payout yako mwezi ujao instead of this month.",
-            "Whisper": "Leotuli patatrinu membas kweni grub, sututad adjust rotation kidogo, utapokia peia utiako muizi ujao instead of this month.",
-            "MMS": "leo tulipata 3 new members kwenye group su tutaadjust tratition kidogo utapokea peauti yako mwezi ujao instead of this month"
-        }
-    ]
+    if not st.session_state.benchmark_results:
+        st.info("No recordings yet — use Record & Query to generate benchmark data.")
+    else:
+        for i, entry in enumerate(st.session_state.benchmark_results):
+            st.markdown(f"**Recording {i+1}**")
+            edited_gt = st.text_area(f"Ground truth (edit if incorrect) — Recording {i+1}", value=entry["ground_truth"], key=f"gt_{i}")
+            st.session_state.benchmark_results[i]["ground_truth"] = edited_gt
 
-    st.dataframe(pd.DataFrame(BENCHMARK_DATA), use_container_width=True, hide_index=True)
+            sahara_acc = word_accuracy(edited_gt, entry["sahara"])
+            whisper_acc = word_accuracy(edited_gt, entry["whisper"])
+            mms_acc = word_accuracy(edited_gt, entry["mms"])
 
-    st.subheader("Key findings")
-    st.markdown("""
-    - **Sahara** preserves code-switched sentence structure and grammar most reliably, but shows run-to-run instability on financial-domain terms specifically (e.g. "loan repayment" → "Yelon repayment" in one run, correct in another).
-    - **Whisper** correctly transcribed the one financial term Sahara mangled ("loan repayment," testcase1), but broke down more severely on basic word boundaries and grammar in longer, faster code-switched speech.
-    - **MMS** (locked to Swahili via `target_lang="swh"`) produced phonetic, uncapitalized transcriptions that treat English words as if sounding them out in Swahili spelling — a distinct third failure mode, consistent with running a monolingual model on code-switched input.
-    - No model was reliably accurate across all three test cases; each had a different, characteristic failure pattern rather than a simple "better/worse" ranking.
-    """)
+            comp_df = pd.DataFrame([
+                {"Model": "Sahara", "Transcript": entry["sahara"], "Word Accuracy": f"{sahara_acc}%"},
+                {"Model": "Whisper", "Transcript": entry["whisper"], "Word Accuracy": f"{whisper_acc}%"},
+                {"Model": "MMS", "Transcript": entry["mms"], "Word Accuracy": f"{mms_acc}%"},
+            ])
+            st.dataframe(comp_df, use_container_width=True, hide_index=True)
+            st.divider()
+
+
+
+
+#     render_header("Benchmark")
+#     st.caption("Comparison across 3 speech models on real code-switched test audio, recorded and evaluated during development.")
+
+#     BENCHMARK_DATA = [
+#         {
+#             "Test Case": "testcase1",
+#             "Ground Truth": "Nimeweka 2000 leo. That's my deposit ya loan repayment, na next Friday ni zamu ya Grace.",
+#             "Sahara": "Nimeweka 2,000 leo. That's my deposit Yelon repayment na next Friday ni za Grace.",
+#             "Whisper": "Nimeweka 2000 lewa. That's my deposit, a loan repayment na next Friday nizamu ya grace.",
+#             "MMS": "nimeweka 200leo dhat's may dipositi ya lon repayment na next fridey ni zamu ya greece"
+#         },
+#         {
+#             "Test Case": "testcase2",
+#             "Ground Truth": "Nimechelewa this month, but nitatuma the full amount next Friday, hiyo iko sawa?",
+#             "Sahara": "Nimechelewa mwezi huu lakini nitatuma kiasi chote Ijumaa ijayo. Hiyo iko sawa.",
+#             "Whisper": "Imechelewa this month, but nita tumade full amount next Friday. Yoi kusawa.",
+#             "MMS": "nimechelewa this month bat nitatuma the fuu la mount next fridey yoo iko sawa"
+#         },
+#         {
+#             "Test Case": "testcase3",
+#             "Ground Truth": "Leo tulipata three new members kwenye group, so tuta-adjust rotation kidogo, utapokea payout yako mwezi ujao instead of this month.",
+#             "Sahara": "Leo tulipata members 3 wapya kwenye group, so tutafanya rotation kidogo, utapokea payout yako mwezi ujao instead of this month.",
+#             "Whisper": "Leotuli patatrinu membas kweni grub, sututad adjust rotation kidogo, utapokia peia utiako muizi ujao instead of this month.",
+#             "MMS": "leo tulipata 3 new members kwenye group su tutaadjust tratition kidogo utapokea peauti yako mwezi ujao instead of this month"
+#         }
+#     ]
+
+#     st.dataframe(pd.DataFrame(BENCHMARK_DATA), use_container_width=True, hide_index=True)
+
+#     st.subheader("Key findings")
+#     st.markdown("""
+#     - **Sahara** preserves code-switched sentence structure and grammar most reliably, but shows run-to-run instability on financial-domain terms specifically (e.g. "loan repayment" → "Yelon repayment" in one run, correct in another).
+#     - **Whisper** correctly transcribed the one financial term Sahara mangled ("loan repayment," testcase1), but broke down more severely on basic word boundaries and grammar in longer, faster code-switched speech.
+#     - **MMS** (locked to Swahili via `target_lang="swh"`) produced phonetic, uncapitalized transcriptions that treat English words as if sounding them out in Swahili spelling — a distinct third failure mode, consistent with running a monolingual model on code-switched input.
+#     - No model was reliably accurate across all three test cases; each had a different, characteristic failure pattern rather than a simple "better/worse" ranking.
+#     """)

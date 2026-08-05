@@ -67,11 +67,10 @@ Respond with ONLY valid JSON in this exact structure, no other text:
     return json.loads(response.choices[0].message.content)
 
 
+
 NUMBER_WORDS = [
-    # English
     "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
     "hundred", "thousand", "million",
-    # Swahili
     "moja", "mbili", "tatu", "nne", "tano", "sita", "saba", "nane", "tisa", "kumi",
     "ishirini", "thelathini", "arobaini", "hamsini", "sitini", "sabini", "themanini", "tisini",
     "mia", "elfu", "milioni"
@@ -81,12 +80,15 @@ def validate_extraction(transcript, extracted):
     if extracted.get("amount") is not None:
         transcript_lower = transcript.lower()
         has_digit = bool(re.search(r'\d', transcript))
-        has_number_word = any(word in transcript_lower for word in NUMBER_WORDS)
+        has_number_word = any(
+            re.search(rf'\b{re.escape(word)}\b', transcript_lower)
+            for word in NUMBER_WORDS
+        )
         if not has_digit and not has_number_word:
             extracted["_original_amount_before_validation"] = extracted["amount"]
             extracted["amount"] = None
             extracted["_flag"] = "amount removed: no digit or number word found in transcript"
-    extracted.pop("reasoning", None)  # drop scratchpad before logging to ledger
+    extracted.pop("reasoning", None)
     return extracted
 
 

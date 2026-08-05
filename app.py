@@ -27,6 +27,17 @@ def transcribe_sahara(audio_path, language="sw"):
 
 
 def extract_chama_action(transcript):
+    
+    if not transcript or len(transcript.strip()) < 5:
+        return json.dumps({
+            "reasoning": "Transcript empty or too short to contain meaningful speech.",
+            "speaker_action": "other",
+            "amount": None,
+            "referenced_member": "none",
+            "referenced_member_context": "none",
+            "action_type": "other"
+        })
+        
     prompt = f"""You are extracting structured data from a chama (savings group) voice message.
 The message may mix English and Swahili. The speaker is usually reporting their own action,
 and may separately reference another member.

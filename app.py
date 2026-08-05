@@ -10,8 +10,7 @@ import string
 # --- Load keys from Streamlit secrets ---
 SAHARA_API_KEY = st.secrets["SAHARA_API_KEY"]
 GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
-HF_API_KEY = st.secrets.get("HF_API_KEY") # new secret, free HF account + free API token
-
+HF_API_KEY = st.secrets.get("HF_API_KEY")
 
 groq_client = Groq(api_key=GROQ_API_KEY)
 
@@ -23,10 +22,22 @@ NUMBER_WORDS = [
     "mia", "elfu", "milioni"
 ]
 SCALE_WORDS = ["elfu", "mia", "thousand", "hundred", "milioni", "million"]
-VALID_SPEAKER_ACTIONS = {"deposit", "payout_received", "late_payment_note", "membership_update", "other"}
+VALID_SPEAKER_ACTIONS = {"deposit", "payout_received", "initiate_payout", "late_payment_note", "membership_update", "loan_request", "other"}
 
-CURRENT_USER = "Wendo"
-IS_ADMIN = True
+ADMIN_ALLOWED_ACTIONS = VALID_SPEAKER_ACTIONS
+MEMBER_ALLOWED_ACTIONS = {"deposit", "payout_received", "late_payment_note", "loan_request", "other"}
+
+# --- Users (demo-only switcher, not real authentication) ---
+USERS = {
+    "Wendo": {"role": "admin"},
+    "Juma": {"role": "member"},
+}
+
+if "current_user_name" not in st.session_state:
+    st.session_state.current_user_name = "Wendo"
+
+CURRENT_USER = st.session_state.current_user_name
+IS_ADMIN = USERS[CURRENT_USER]["role"] == "admin"
 
 # --- Mock chama data (clearly illustrative, not real transaction history) ---
 MOCK_MEMBERS = {
@@ -35,12 +46,15 @@ MOCK_MEMBERS = {
     "John":   {"ytd_contributed": 18000, "this_month_paid": False, "last_paid": "2026-06-28", "owed": 4000,  "loan_eligible": 12000, "payout_position": 2},
     "Amina":  {"ytd_contributed": 24000, "this_month_paid": True,  "last_paid": "2026-08-03", "owed": 0,     "loan_eligible": 20000, "payout_position": 4},
     "Peter":  {"ytd_contributed": 16000, "this_month_paid": False, "last_paid": "2026-07-15", "owed": 2000,  "loan_eligible": 10000, "payout_position": 5},
+    "Juma":   {"ytd_contributed": 12000, "this_month_paid": True,  "last_paid": "2026-08-01", "owed": 0,     "loan_eligible": 8000,  "payout_position": 6},
 }
 
 MOCK_MONTHLY_TOTALS = pd.DataFrame({
     "Month": ["Mar", "Apr", "May", "Jun", "Jul", "Aug"],
     "Collected": [18000, 19500, 21000, 20500, 22000, 21000]
 })
+
+CURRENT_PAYOUT_POSITION = 3  # mock: whose turn it is this month
 
 
 def transcribe_sahara(audio_path, language="sw"):
@@ -55,7 +69,6 @@ def transcribe_sahara(audio_path, language="sw"):
         return response.json()["data"]["audio_transcript"]
     except requests.exceptions.JSONDecodeError:
         raise Exception(f"Sahara returned non-JSON response: {response.text[:300]}")
-
 
 
 from huggingface_hub import InferenceClient
@@ -137,6 +150,8 @@ CRITICAL RULES:
 - If the speaker uses future tense (e.g. "nitatuma" / "I will send") without saying they already paid, this is NOT a completed deposit.
 - Vague quantity words (e.g. "kidogo" / "a little" / "some") are NOT numbers. Never convert them into a numeric guess.
 - referenced_member must be an actual person's name, never a number or group description. If none, use "none".
+- If the speaker is COMMANDING money be sent to someone else (e.g. "Tuma X kwa Y"), this is "initiate_payout", not "payout_received".
+- If the speaker is asking to BORROW money for themselves, this is "loan_request".
 
 Example 1:
 Transcript: "Nimechelewa mwezi huu lakini nitatuma kiasi chote Ijumaa ijayo."
@@ -145,6 +160,14 @@ Correct extraction: {{"reasoning": "Speaker is reporting their own status. Futur
 Example 2:
 Transcript: "Nimetuma pesa kidogo leo."
 Correct extraction: {{"reasoning": "Speaker completed an action ('nimetuma'). 'Kidogo' is a vague qualifier, not a digit or number word, so no real amount was stated.", "speaker_action": "deposit", "amount": null, "referenced_member": "none", "referenced_member_context": "none", "action_type": "deposit"}}
+
+Example 3:
+Transcript: "Tuma elfu mbili kwa Grace leo."
+Correct extraction: {{"reasoning": "Speaker is issuing a command to send money to another member — this is initiating a payout, not reporting one received.", "speaker_action": "initiate_payout", "amount": 2000, "referenced_member": "Grace", "referenced_member_context": "payout recipient", "action_type": "payout"}}
+
+Example 4:
+Transcript: "Naomba mkopo wa elfu tano."
+Correct extraction: {{"reasoning": "Speaker is requesting to borrow money for themselves from the group.", "speaker_action": "loan_request", "amount": 5000, "referenced_member": "none", "referenced_member_context": "none", "action_type": "other"}}
 
 Now extract from this transcript:
 Transcript: "{transcript}"
@@ -185,6 +208,26 @@ def validate_extraction(transcript, extracted):
     return extracted
 
 
+def check_payout_eligibility(member_name, amount):
+    """Simulated eligibility check — no real payment is ever sent."""
+    member = MOCK_MEMBERS.get(member_name)
+    if not member:
+        return False, f"{member_name} is not a registered member."
+    if member["payout_position"] != CURRENT_PAYOUT_POSITION:
+        return False, f"{member_name} is not scheduled to receive a payout this month. It is currently position {CURRENT_PAYOUT_POSITION}'s turn."
+    return True, f"{member_name} is eligible. [SIMULATED] Would send {amount} to their registered phone number."
+
+
+def check_loan_eligibility(member_name, amount):
+    """Simulated loan eligibility check against mock loan_eligible cap."""
+    member = MOCK_MEMBERS.get(member_name)
+    if not member:
+        return False, f"{member_name} is not a registered member."
+    if amount > member["loan_eligible"]:
+        return False, f"{member_name} requested {amount}, which exceeds their eligible limit of {member['loan_eligible']}."
+    return True, f"{member_name} is eligible for a loan of {amount}. [SIMULATED] Would send funds to their registered phone number."
+
+
 def generate_tts(text, voice_accent="swahili", voice_gender="female", voice_language="en"):
     url = "https://infer.voice.intron.io/tts/v1/generate"
     headers = {"Authorization": f"Bearer {SAHARA_API_KEY}", "Content-Type": "application/json"}
@@ -198,6 +241,10 @@ def generate_confirmation_text(entry):
         text = f"Confirmed: deposit of {entry['amount']} logged."
         if entry["referenced_member"] != "none":
             text += f" Noted: {entry['referenced_member']} — {entry['referenced_member_context']}."
+    elif entry["speaker_action"] == "initiate_payout":
+        text = f"Processing payout request for {entry['referenced_member']}."
+    elif entry["speaker_action"] == "loan_request":
+        text = f"Loan request of {entry['amount']} logged, pending admin approval."
     elif entry["speaker_action"] == "late_payment_note":
         text = "Noted: you'll be sending your payment late. No amount logged yet."
     elif entry["speaker_action"] == "membership_update":
@@ -235,9 +282,12 @@ if "benchmark_results" not in st.session_state:
 if "last_processed_audio_id" not in st.session_state:
     st.session_state.last_processed_audio_id = None
 
+if "loan_requests" not in st.session_state:
+    st.session_state.loan_requests = []
+
 # --- Sidebar ---
 st.sidebar.title("🎙️ Habahub")
-st.sidebar.markdown(f"**{CURRENT_USER}** {'(Admin)' if IS_ADMIN else ''}")
+st.sidebar.markdown(f"**{CURRENT_USER}** ({'Admin' if IS_ADMIN else 'Member'})")
 st.sidebar.divider()
 page = st.sidebar.radio("Navigate", ["Dashboard", "Record & Query", "Benchmark"])
 
@@ -246,11 +296,15 @@ def render_header(title):
     with col1:
         st.title(title)
     with col2:
-        st.write("")  # vertical spacer to align with title
+        st.write("")
         with st.popover(f"👤 {CURRENT_USER}"):
             st.write(f"**{CURRENT_USER}**")
             st.caption("Admin" if IS_ADMIN else "Member")
             st.divider()
+            new_user = st.selectbox("Switch user (demo only)", list(USERS.keys()), index=list(USERS.keys()).index(CURRENT_USER), key="user_switcher")
+            if new_user != CURRENT_USER:
+                st.session_state.current_user_name = new_user
+                st.rerun()
             st.button("Log out", disabled=True, help="Demo only — not functional")
 
 speaking_as = CURRENT_USER
@@ -260,7 +314,7 @@ speaking_as = CURRENT_USER
 # ============================================================
 if page == "Record & Query":
     render_header("Record & Query")
-    st.write("Speak a contribution, payment note, update — or ask a question about your account — in English, Swahili, or both.")
+    st.write("Speak a contribution, payment note, loan request, or update — or ask a question about your account — in English, Swahili, or both.")
     audio = st.audio_input("Record your message")
 
     if audio is not None:
@@ -326,39 +380,74 @@ if page == "Record & Query":
             if "_flag_invalid_speaker_action" in extracted:
                 st.warning(f"⚠️ Unrecognized action type: '{extracted['_flag_invalid_speaker_action']}' — defaulted to 'other'.")
 
+            allowed_actions = list(ADMIN_ALLOWED_ACTIONS) if IS_ADMIN else list(MEMBER_ALLOWED_ACTIONS)
+            if extracted["speaker_action"] not in allowed_actions:
+                st.warning(f"⚠️ '{extracted['speaker_action']}' is not permitted for your role. Defaulted to 'other'.")
+                extracted["speaker_action"] = "other"
+
             st.subheader("Review before submitting")
             edited_speaker_action = st.selectbox(
-                "Action", list(VALID_SPEAKER_ACTIONS),
-                index=list(VALID_SPEAKER_ACTIONS).index(extracted["speaker_action"])
+                "Action", allowed_actions,
+                index=allowed_actions.index(extracted["speaker_action"])
             )
             edited_amount = st.number_input(
                 "Amount", value=float(extracted["amount"]) if extracted["amount"] is not None else 0.0,
                 min_value=0.0, step=1.0
             )
-            edited_referenced_member = st.text_input("Referenced member", value=extracted["referenced_member"])
+
+            if IS_ADMIN:
+                edited_referenced_member = st.text_input("Referenced member", value=extracted["referenced_member"])
+            else:
+                st.text_input("Referenced member", value="none", disabled=True, help="Members can only log actions about themselves.")
+                edited_referenced_member = "none"
 
             if st.button("Confirm and submit"):
-                was_amended = (
-                    edited_speaker_action != extracted["speaker_action"]
-                    or (extracted["amount"] is not None and edited_amount != extracted["amount"])
-                    or (extracted["amount"] is None and edited_amount != 0.0)
-                    or edited_referenced_member != extracted["referenced_member"]
-                )
-                final_entry = dict(extracted)
-                final_entry["speaker"] = speaking_as
-                final_entry["speaker_action"] = edited_speaker_action
-                final_entry["amount"] = edited_amount if edited_amount > 0 else None
-                final_entry["referenced_member"] = edited_referenced_member
-                final_entry["amended_by_human"] = was_amended
-                final_entry["ai_original_amount"] = extracted["amount"]
-                final_entry["ai_original_speaker_action"] = extracted["speaker_action"]
+                if not IS_ADMIN and edited_referenced_member not in ("none", CURRENT_USER):
+                    st.error("❌ Members can only log actions about themselves.")
+                else:
+                    was_amended = (
+                        edited_speaker_action != extracted["speaker_action"]
+                        or (extracted["amount"] is not None and edited_amount != extracted["amount"])
+                        or (extracted["amount"] is None and edited_amount != 0.0)
+                        or edited_referenced_member != extracted["referenced_member"]
+                    )
+                    ai_action_taken = False
 
-                st.session_state.ledger.append(final_entry)
-                confirmation_text = generate_confirmation_text(final_entry)
-                with st.spinner("Generating spoken confirmation..."):
-                    audio_url = generate_tts(confirmation_text)
-                st.write("**Confirmation:**", confirmation_text)
-                st.audio(audio_url)
+                    final_entry = dict(extracted)
+                    final_entry["speaker"] = speaking_as
+                    final_entry["speaker_action"] = edited_speaker_action
+                    final_entry["amount"] = edited_amount if edited_amount > 0 else None
+                    final_entry["referenced_member"] = edited_referenced_member
+                    final_entry["amended_by_human"] = was_amended
+                    final_entry["ai_original_amount"] = extracted["amount"]
+                    final_entry["ai_original_speaker_action"] = extracted["speaker_action"]
+
+                    confirmation_text = generate_confirmation_text(final_entry)
+
+                    if edited_speaker_action == "loan_request":
+                        st.session_state.loan_requests.append({
+                            "member": speaking_as,
+                            "amount": final_entry["amount"],
+                            "status": "pending"
+                        })
+
+                    if edited_speaker_action == "initiate_payout" and IS_ADMIN and edited_referenced_member not in ("none", ""):
+                        eligible, elig_message = check_payout_eligibility(edited_referenced_member, edited_amount)
+                        ai_action_taken = True
+                        if eligible:
+                            st.success(f"✅ SIMULATED PAYMENT — {elig_message}")
+                            confirmation_text += f" Payment of {edited_amount} sent to {edited_referenced_member}. Simulated transaction — no real funds moved."
+                        else:
+                            st.error(f"❌ Payment blocked (simulated check) — {elig_message}")
+                            confirmation_text += f" Payment blocked. {elig_message}"
+
+                    final_entry["ai_action_taken"] = ai_action_taken
+
+                    st.session_state.ledger.append(final_entry)
+                    with st.spinner("Generating spoken confirmation..."):
+                        audio_url = generate_tts(confirmation_text)
+                    st.write("**Confirmation:**", confirmation_text)
+                    st.audio(audio_url)
 
     st.divider()
     st.subheader("Session Ledger")
@@ -371,35 +460,85 @@ elif page == "Dashboard":
     render_header("Dashboard")
     st.caption("⚠️ Illustrative demo data — not live transaction history.")
 
-    total_ytd = sum(m["ytd_contributed"] for m in MOCK_MEMBERS.values())
-    this_month = MOCK_MONTHLY_TOTALS["Collected"].iloc[-1]
-    last_month = MOCK_MONTHLY_TOTALS["Collected"].iloc[-2]
-    paid_this_month = sum(1 for m in MOCK_MEMBERS.values() if m["this_month_paid"])
+    if IS_ADMIN:
+        total_ytd = sum(m["ytd_contributed"] for m in MOCK_MEMBERS.values())
+        this_month = MOCK_MONTHLY_TOTALS["Collected"].iloc[-1]
+        last_month = MOCK_MONTHLY_TOTALS["Collected"].iloc[-2]
+        paid_this_month = sum(1 for m in MOCK_MEMBERS.values() if m["this_month_paid"])
 
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Total collected (YTD)", f"KES {total_ytd:,}")
-    col2.metric("Collected this month", f"KES {this_month:,}", delta=f"{this_month - last_month:+,}")
-    col3.metric("Members paid this month", f"{paid_this_month}/{len(MOCK_MEMBERS)}")
-    col4.metric("Total owed to group", f"KES {sum(m['owed'] for m in MOCK_MEMBERS.values()):,}")
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Total collected (YTD)", f"KES {total_ytd:,}")
+        col2.metric("Collected this month", f"KES {this_month:,}", delta=f"{this_month - last_month:+,}")
+        col3.metric("Members paid this month", f"{paid_this_month}/{len(MOCK_MEMBERS)}")
+        col4.metric("Total owed to group", f"KES {sum(m['owed'] for m in MOCK_MEMBERS.values()):,}")
 
-    st.subheader("Monthly collections")
-    st.bar_chart(MOCK_MONTHLY_TOTALS.set_index("Month"))
+        st.subheader("Monthly collections")
+        st.bar_chart(MOCK_MONTHLY_TOTALS.set_index("Month"))
 
-    st.subheader("Member contributions")
-    member_df = pd.DataFrame([
-        {"Member": name, "YTD Contributed": v["ytd_contributed"], "Paid this month": "✅" if v["this_month_paid"] else "❌",
-         "Last paid": v["last_paid"], "Owed": v["owed"], "Loan eligible": v["loan_eligible"]}
-        for name, v in MOCK_MEMBERS.items()
-    ])
-    st.dataframe(member_df, use_container_width=True, hide_index=True)
+        st.subheader("Member contributions")
+        member_df = pd.DataFrame([
+            {"Member": name, "YTD Contributed": v["ytd_contributed"], "Paid this month": "✅" if v["this_month_paid"] else "❌",
+             "Last paid": v["last_paid"], "Owed": v["owed"], "Loan eligible": v["loan_eligible"]}
+            for name, v in MOCK_MEMBERS.items()
+        ])
+        st.dataframe(member_df, use_container_width=True, hide_index=True)
 
-    st.subheader("Payout rotation order")
-    rotation_df = pd.DataFrame([
-        {"Position": v["payout_position"], "Member": name}
-        for name, v in MOCK_MEMBERS.items()
-    ]).sort_values("Position")
-    st.dataframe(rotation_df, use_container_width=True, hide_index=True)
+        st.subheader("Payout rotation order")
+        rotation_df = pd.DataFrame([
+            {"Position": v["payout_position"], "Member": name}
+            for name, v in MOCK_MEMBERS.items()
+        ]).sort_values("Position")
+        st.dataframe(rotation_df, use_container_width=True, hide_index=True)
 
+        st.subheader("Pending loan requests")
+        pending = [lr for lr in st.session_state.loan_requests if lr["status"] == "pending"]
+        if not pending:
+            st.info("No pending loan requests.")
+        else:
+            for idx, lr in enumerate(st.session_state.loan_requests):
+                if lr["status"] != "pending":
+                    continue
+                col1, col2, col3 = st.columns([3, 2, 2])
+                col1.write(f"**{lr['member']}** requests **{lr['amount']}**")
+                if col2.button("Approve", key=f"approve_{idx}"):
+                    eligible, elig_message = check_loan_eligibility(lr["member"], lr["amount"])
+                    if eligible:
+                        st.session_state.loan_requests[idx]["status"] = "approved"
+                        st.session_state.ledger.append({
+                            "speaker": CURRENT_USER,
+                            "speaker_action": "initiate_payout",
+                            "amount": lr["amount"],
+                            "referenced_member": lr["member"],
+                            "referenced_member_context": "loan approval",
+                            "action_type": "payout",
+                            "amended_by_human": False,
+                            "ai_action_taken": True
+                        })
+                        st.success(f"✅ SIMULATED LOAN PAYMENT — {elig_message}")
+                        st.rerun()
+                    else:
+                        st.error(f"❌ {elig_message}")
+                if col3.button("Reject", key=f"reject_{idx}"):
+                    st.session_state.loan_requests[idx]["status"] = "rejected"
+                    st.rerun()
+
+    else:
+        my_data = MOCK_MEMBERS.get(CURRENT_USER, {})
+        st.subheader(f"Your account — {CURRENT_USER}")
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Your YTD contributions", f"KES {my_data.get('ytd_contributed', 0):,}")
+        col2.metric("Paid this month", "✅" if my_data.get("this_month_paid") else "❌")
+        col3.metric("Amount owed", f"KES {my_data.get('owed', 0):,}")
+        st.write(f"**Last paid:** {my_data.get('last_paid', 'N/A')}")
+        st.write(f"**Loan eligible up to:** KES {my_data.get('loan_eligible', 0):,}")
+        st.write(f"**Your payout position:** {my_data.get('payout_position', 'N/A')} (current turn: position {CURRENT_PAYOUT_POSITION})")
+
+        st.subheader("Your loan requests")
+        my_loans = [lr for lr in st.session_state.loan_requests if lr["member"] == CURRENT_USER]
+        if not my_loans:
+            st.info("No loan requests yet.")
+        else:
+            st.dataframe(pd.DataFrame(my_loans), use_container_width=True, hide_index=True)
 
 # ============================================================
 # PAGE 3: Benchmark
@@ -423,7 +562,7 @@ elif page == "Benchmark":
                     label_visibility="collapsed"
                 )
             with col2:
-                st.write("")  # spacer to align button with text area
+                st.write("")
                 if st.button("Update", key=f"update_btn_{i}"):
                     st.session_state.benchmark_results[i]["ground_truth"] = gt_input
                     st.rerun()
@@ -441,41 +580,3 @@ elif page == "Benchmark":
             ])
             st.dataframe(comp_df, use_container_width=True, hide_index=True)
             st.divider()
-
-
-#     render_header("Benchmark")
-#     st.caption("Comparison across 3 speech models on real code-switched test audio, recorded and evaluated during development.")
-
-#     BENCHMARK_DATA = [
-#         {
-#             "Test Case": "testcase1",
-#             "Ground Truth": "Nimeweka 2000 leo. That's my deposit ya loan repayment, na next Friday ni zamu ya Grace.",
-#             "Sahara": "Nimeweka 2,000 leo. That's my deposit Yelon repayment na next Friday ni za Grace.",
-#             "Whisper": "Nimeweka 2000 lewa. That's my deposit, a loan repayment na next Friday nizamu ya grace.",
-#             "MMS": "nimeweka 200leo dhat's may dipositi ya lon repayment na next fridey ni zamu ya greece"
-#         },
-#         {
-#             "Test Case": "testcase2",
-#             "Ground Truth": "Nimechelewa this month, but nitatuma the full amount next Friday, hiyo iko sawa?",
-#             "Sahara": "Nimechelewa mwezi huu lakini nitatuma kiasi chote Ijumaa ijayo. Hiyo iko sawa.",
-#             "Whisper": "Imechelewa this month, but nita tumade full amount next Friday. Yoi kusawa.",
-#             "MMS": "nimechelewa this month bat nitatuma the fuu la mount next fridey yoo iko sawa"
-#         },
-#         {
-#             "Test Case": "testcase3",
-#             "Ground Truth": "Leo tulipata three new members kwenye group, so tuta-adjust rotation kidogo, utapokea payout yako mwezi ujao instead of this month.",
-#             "Sahara": "Leo tulipata members 3 wapya kwenye group, so tutafanya rotation kidogo, utapokea payout yako mwezi ujao instead of this month.",
-#             "Whisper": "Leotuli patatrinu membas kweni grub, sututad adjust rotation kidogo, utapokia peia utiako muizi ujao instead of this month.",
-#             "MMS": "leo tulipata 3 new members kwenye group su tutaadjust tratition kidogo utapokea peauti yako mwezi ujao instead of this month"
-#         }
-#     ]
-
-#     st.dataframe(pd.DataFrame(BENCHMARK_DATA), use_container_width=True, hide_index=True)
-
-#     st.subheader("Key findings")
-#     st.markdown("""
-#     - **Sahara** preserves code-switched sentence structure and grammar most reliably, but shows run-to-run instability on financial-domain terms specifically (e.g. "loan repayment" → "Yelon repayment" in one run, correct in another).
-#     - **Whisper** correctly transcribed the one financial term Sahara mangled ("loan repayment," testcase1), but broke down more severely on basic word boundaries and grammar in longer, faster code-switched speech.
-#     - **MMS** (locked to Swahili via `target_lang="swh"`) produced phonetic, uncapitalized transcriptions that treat English words as if sounding them out in Swahili spelling — a distinct third failure mode, consistent with running a monolingual model on code-switched input.
-#     - No model was reliably accurate across all three test cases; each had a different, characteristic failure pattern rather than a simple "better/worse" ranking.
-#     """)

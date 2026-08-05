@@ -4,14 +4,13 @@ import json
 from groq import Groq
 import re
 import pandas as pd
-import torch
-import string
 import calendar
+import zipfile
+import io
 from datetime import date, timedelta
 
 SAHARA_API_KEY = st.secrets["SAHARA_API_KEY"]
 GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
-HF_API_KEY = st.secrets.get("HF_API_KEY")
 
 groq_client = Groq(api_key=GROQ_API_KEY)
 
@@ -66,6 +65,8 @@ SCHEDULE_START_MONTH = 8
 REAL_TODAY = date.today()
 CURRENT_MONTH_INDEX = REAL_TODAY.month
 
+BENCHMARK_SAMPLE_START_INDEX = 4  # continues from testcase1-3 already used in the notebook
+
 
 def get_member_by_position(position):
     for name, data in MOCK_MEMBERS.items():
@@ -85,7 +86,7 @@ def compute_date_for_offset(offset_months):
 def build_initial_schedule():
     positions_sorted = sorted(MOCK_MEMBERS.items(), key=lambda x: x[1]["payout_position"])
     schedule = {data["payout_position"]: compute_date_for_offset(i) for i, (name, data) in enumerate(positions_sorted)}
-    schedule[1] = date.today()  # override: position 1's payout is due today, for demo purposes
+    schedule[1] = date.today()
     return schedule
 
 
@@ -98,15 +99,14 @@ def get_next_friday(from_date):
 
 if "payout_schedule" not in st.session_state:
     st.session_state.payout_schedule = build_initial_schedule()
-
 if "payouts_made_positions" not in st.session_state:
     st.session_state.payouts_made_positions = set()
-
 if "simulated_today" not in st.session_state:
     st.session_state.simulated_today = date.today()
-
 if "scheduled_reminders" not in st.session_state:
     st.session_state.scheduled_reminders = []
+if "benchmark_samples" not in st.session_state:
+    st.session_state.benchmark_samples = []  # list of {index, audio_bytes, ground_truth}
 
 
 def get_pending_loan_for_member(member_name):
@@ -128,34 +128,6 @@ def transcribe_sahara(audio_path, language="sw"):
         return response.json()["data"]["audio_transcript"]
     except requests.exceptions.JSONDecodeError:
         raise Exception(f"Sahara returned non-JSON response: {response.text[:300]}")
-
-
-from huggingface_hub import InferenceClient
-
-def transcribe_whisper_hf(audio_path):
-    client = InferenceClient(provider="fal-ai", api_key=HF_API_KEY)
-    result = client.automatic_speech_recognition(audio_path, model="openai/whisper-large-v3")
-    return result.text
-
-@st.cache_resource
-def load_mms_model():
-    from transformers import Wav2Vec2ForCTC, AutoProcessor
-    model_id = "facebook/mms-1b-all"
-    processor = AutoProcessor.from_pretrained(model_id, target_lang="swh", token=HF_API_KEY)
-    model = Wav2Vec2ForCTC.from_pretrained(model_id, target_lang="swh", ignore_mismatched_sizes=True, token=HF_API_KEY)
-    return processor, model
-
-def transcribe_mms(audio_path):
-    import torchaudio
-    processor, model = load_mms_model()
-    speech, sr = torchaudio.load(audio_path)
-    if sr != 16000:
-        speech = torchaudio.functional.resample(speech, sr, 16000)
-    inputs = processor(speech.squeeze().numpy(), sampling_rate=16000, return_tensors="pt")
-    with torch.no_grad():
-        logits = model(**inputs).logits
-    ids = torch.argmax(logits, dim=-1)[0]
-    return processor.decode(ids)
 
 
 def classify_intent(transcript):
@@ -349,28 +321,10 @@ def generate_confirmation_text(entry):
     return text
 
 
-def word_accuracy(ground_truth, model_output):
-    if not model_output or model_output.startswith("[failed"):
-        return 0.0
-
-    def clean_words(text):
-        text = text.lower().translate(str.maketrans("", "", string.punctuation))
-        return set(text.split())
-
-    gt_words = clean_words(ground_truth)
-    model_words = clean_words(model_output)
-    if not gt_words:
-        return 0.0
-    correct = len(gt_words & model_words)
-    return round((correct / len(gt_words)) * 100, 1)
-
-
 st.set_page_config(page_title="Habahub", page_icon="🎙️", layout="wide")
 
 if "ledger" not in st.session_state:
     st.session_state.ledger = []
-if "benchmark_results" not in st.session_state:
-    st.session_state.benchmark_results = []
 if "last_processed_audio_id" not in st.session_state:
     st.session_state.last_processed_audio_id = None
 if "loan_requests" not in st.session_state:
@@ -381,7 +335,7 @@ if "pending_loan_review" not in st.session_state:
 st.sidebar.title("🎙️ Habahub")
 st.sidebar.markdown(f"**{CURRENT_USER}** ({'Admin' if IS_ADMIN else 'Member'})")
 st.sidebar.divider()
-page = st.sidebar.radio("Navigate", ["Dashboard", "Record & Query", "Benchmark"])
+page = st.sidebar.radio("Navigate", ["Dashboard", "Record & Query", "Benchmark Data"])
 
 def render_header(title):
     col1, col2 = st.columns([5, 1])
@@ -416,6 +370,7 @@ if page == "Record & Query":
 
         if st.session_state.last_processed_audio_id != audio_id:
             st.session_state.last_processed_audio_id = audio_id
+            st.session_state.current_audio_bytes = audio_bytes
 
             with open("temp_input.wav", "wb") as f:
                 f.write(audio_bytes)
@@ -423,23 +378,6 @@ if page == "Record & Query":
             with st.spinner("Transcribing..."):
                 transcript = transcribe_sahara("temp_input.wav")
             st.session_state.current_transcript = transcript
-
-            with st.spinner("Running benchmark comparison..."):
-                try:
-                    whisper_result = transcribe_whisper_hf("temp_input.wav")
-                except Exception as e:
-                    whisper_result = f"[failed: {e}]"
-                try:
-                    mms_result = transcribe_mms("temp_input.wav")
-                except Exception as e:
-                    mms_result = f"[failed: {e}]"
-
-            st.session_state.benchmark_results.append({
-                "ground_truth": transcript,
-                "sahara": transcript,
-                "whisper": whisper_result,
-                "mms": mms_result
-            })
 
             with st.spinner("Understanding your message..."):
                 intent = classify_intent(transcript)
@@ -455,6 +393,17 @@ if page == "Record & Query":
         transcript = st.session_state.current_transcript
         intent = st.session_state.current_intent
         st.write("**Transcript:**", transcript)
+
+        with st.expander("📥 Save this recording for the benchmark dataset"):
+            gt_edit = st.text_area("Ground truth (edit to match what was actually said)", value=transcript, key="gt_edit_current")
+            if st.button("Save as benchmark sample"):
+                sample_index = BENCHMARK_SAMPLE_START_INDEX + len(st.session_state.benchmark_samples)
+                st.session_state.benchmark_samples.append({
+                    "index": sample_index,
+                    "audio_bytes": st.session_state.current_audio_bytes,
+                    "ground_truth": gt_edit
+                })
+                st.success(f"✅ Saved as testcase{sample_index}. View and download it on the Benchmark Data page.")
 
         if intent == "question":
             with st.spinner("Checking records..."):
@@ -621,7 +570,7 @@ if page == "Record & Query":
 
     st.divider()
     st.subheader("Session Ledger")
-    st.dataframe(st.session_state.ledger, width='stretch')
+    st.dataframe(st.session_state.ledger, use_container_width=True)
 
 # ============================================================
 # PAGE 2: Dashboard
@@ -662,14 +611,14 @@ elif page == "Dashboard":
              "Last paid": v["last_paid"], "Owed": v["owed"], "Loan eligible": v["loan_eligible"]}
             for name, v in MOCK_MEMBERS.items()
         ])
-        st.dataframe(member_df, width='stretch', hide_index=True)
+        st.dataframe(member_df, use_container_width=True, hide_index=True)
 
         st.subheader("Payout rotation order")
         rotation_df = pd.DataFrame([
             {"Position": v["payout_position"], "Member": name, "Scheduled Date": st.session_state.payout_schedule[v["payout_position"]].strftime("%d/%m/%Y")}
             for name, v in MOCK_MEMBERS.items()
         ]).sort_values("Position")
-        st.dataframe(rotation_df, width='stretch', hide_index=True)
+        st.dataframe(rotation_df, use_container_width=True, hide_index=True)
 
         st.subheader("Loan requests")
         tab_pending, tab_approved, tab_rejected = st.tabs(["Pending", "Approved", "Rejected"])
@@ -711,14 +660,14 @@ elif page == "Dashboard":
             if not approved:
                 st.info("No approved loan requests yet.")
             else:
-                st.dataframe(pd.DataFrame(approved), width='stretch', hide_index=True)
+                st.dataframe(pd.DataFrame(approved), use_container_width=True, hide_index=True)
 
         with tab_rejected:
             rejected = [lr for lr in st.session_state.loan_requests if lr["status"] == "rejected"]
             if not rejected:
                 st.info("No rejected loan requests.")
             else:
-                st.dataframe(pd.DataFrame(rejected), width='stretch', hide_index=True)
+                st.dataframe(pd.DataFrame(rejected), use_container_width=True, hide_index=True)
 
         st.subheader("Scheduled payment reminders")
         st.caption("Members' self-reported commitments to pay late — for tracking, not enforcement.")
@@ -730,7 +679,7 @@ elif page == "Dashboard":
             display_df = reminders_df[["member", "Amount", "category", "date", "time", "status"]].rename(columns={
                 "member": "Member", "category": "Type", "date": "Date", "time": "Time", "status": "Status"
             })
-            st.dataframe(display_df, width='stretch', hide_index=True)
+            st.dataframe(display_df, use_container_width=True, hide_index=True)
 
     else:
         my_data = MOCK_MEMBERS.get(CURRENT_USER, {})
@@ -758,57 +707,62 @@ elif page == "Dashboard":
         if not my_loans:
             st.info("No loan requests yet.")
         else:
-            st.dataframe(pd.DataFrame(my_loans), width='stretch', hide_index=True)
+            st.dataframe(pd.DataFrame(my_loans), use_container_width=True, hide_index=True)
 
 # ============================================================
-# PAGE 3: Benchmark
+# PAGE 3: Benchmark Data
 # ============================================================
-elif page == "Benchmark":
-    render_header("Benchmark")
-    st.caption("Live results from Record & Query, benchmarked against editable ground truth.")
+elif page == "Benchmark Data":
+    render_header("Benchmark Data")
+    st.caption("⚠️ Storage here is temporary — tied to this browser session only. Download files before closing the tab or redeploying the app, or they will be lost.")
 
-    if not st.session_state.benchmark_results:
-        st.info("No recordings yet — use Record & Query to generate benchmark data.")
+    if not st.session_state.benchmark_samples:
+        st.info("No benchmark samples saved yet. Save recordings from the Record & Query page.")
     else:
-        all_sahara, all_whisper, all_mms = [], [], []
+        for i, sample in enumerate(st.session_state.benchmark_samples):
+            idx = sample["index"]
+            st.markdown(f"**testcase{idx}**")
 
-        for i, entry in enumerate(st.session_state.benchmark_results):
-            st.markdown(f"**Recording {i+1}**")
-
-            col1, col2 = st.columns([5, 1])
+            col1, col2 = st.columns([4, 1])
             with col1:
-                gt_input = st.text_area(
-                    f"Ground truth — Recording {i+1}",
-                    value=entry["ground_truth"],
-                    key=f"gt_input_{i}",
-                    label_visibility="collapsed"
-                )
+                st.audio(sample["audio_bytes"])
+                new_gt = st.text_area(f"Ground truth — testcase{idx}", value=sample["ground_truth"], key=f"bench_gt_{i}", label_visibility="collapsed")
             with col2:
-                st.write("")
-                if st.button("Update", key=f"update_btn_{i}"):
-                    st.session_state.benchmark_results[i]["ground_truth"] = gt_input
+                if st.button("Update", key=f"bench_update_{i}"):
+                    st.session_state.benchmark_samples[i]["ground_truth"] = new_gt
+                    st.success("Updated.")
+                if st.button("Delete", key=f"bench_delete_{i}"):
+                    st.session_state.benchmark_samples.pop(i)
                     st.rerun()
 
-            applied_gt = st.session_state.benchmark_results[i]["ground_truth"]
-
-            sahara_acc = word_accuracy(applied_gt, entry["sahara"])
-            whisper_acc = word_accuracy(applied_gt, entry["whisper"])
-            mms_acc = word_accuracy(applied_gt, entry["mms"])
-
-            all_sahara.append(sahara_acc)
-            all_whisper.append(whisper_acc)
-            all_mms.append(mms_acc)
-
-            comp_df = pd.DataFrame([
-                {"Model": "Sahara", "Transcript": entry["sahara"], "Word Accuracy": f"{sahara_acc}%"},
-                {"Model": "Whisper", "Transcript": entry["whisper"], "Word Accuracy": f"{whisper_acc}%"},
-                {"Model": "MMS", "Transcript": entry["mms"], "Word Accuracy": f"{mms_acc}%"},
-            ])
-            st.dataframe(comp_df, width='stretch', hide_index=True)
+            dl_col1, dl_col2 = st.columns(2)
+            dl_col1.download_button(
+                f"Download testcase{idx}.wav",
+                data=sample["audio_bytes"],
+                file_name=f"testcase{idx}.wav",
+                mime="audio/wav",
+                key=f"dl_wav_{i}"
+            )
+            dl_col2.download_button(
+                f"Download testcase{idx}.txt",
+                data=sample["ground_truth"],
+                file_name=f"testcase{idx}.txt",
+                mime="text/plain",
+                key=f"dl_txt_{i}"
+            )
             st.divider()
 
-        st.subheader("Average accuracy across all recordings")
-        avg_col1, avg_col2, avg_col3 = st.columns(3)
-        avg_col1.metric("Sahara avg", f"{round(sum(all_sahara)/len(all_sahara), 1)}%")
-        avg_col2.metric("Whisper avg", f"{round(sum(all_whisper)/len(all_whisper), 1)}%")
-        avg_col3.metric("MMS avg", f"{round(sum(all_mms)/len(all_mms), 1)}%")
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, "w") as zf:
+            for sample in st.session_state.benchmark_samples:
+                idx = sample["index"]
+                zf.writestr(f"testcase{idx}.wav", sample["audio_bytes"])
+                zf.writestr(f"testcase{idx}.txt", sample["ground_truth"])
+        zip_buffer.seek(0)
+
+        st.download_button(
+            "⬇️ Download all as .zip",
+            data=zip_buffer,
+            file_name="benchmark_samples.zip",
+            mime="application/zip"
+        )

@@ -58,7 +58,7 @@ def transcribe_sahara(audio_path, language="sw"):
 
 
 def transcribe_whisper_hf(audio_path):
-    api_url = "https://api-inference.huggingface.co/models/openai/whisper-small"
+    api_url = "https://router.huggingface.co/hf-inference/models/openai/whisper-small"
     headers = {"Authorization": f"Bearer {HF_API_KEY}"}
     with open(audio_path, "rb") as f:
         data = f.read()

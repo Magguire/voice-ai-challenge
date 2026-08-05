@@ -2,6 +2,7 @@ streamlit==1.60.0
 requests
 groq
 torch
+torchvision
+torchcodec
 transformers
 torchaudio
-torchvision

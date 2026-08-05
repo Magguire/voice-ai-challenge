@@ -5,6 +5,7 @@ from groq import Groq
 import re
 import pandas as pd
 import torch
+import string
 
 # --- Load keys from Streamlit secrets ---
 SAHARA_API_KEY = st.secrets["SAHARA_API_KEY"]
@@ -206,8 +207,6 @@ def generate_confirmation_text(entry):
     return text
 
 
-import string
-
 def word_accuracy(ground_truth, model_output):
     if not model_output or model_output.startswith("[failed"):
         return 0.0
@@ -229,9 +228,12 @@ st.set_page_config(page_title="Habahub", page_icon="🎙️", layout="wide")
 
 if "ledger" not in st.session_state:
     st.session_state.ledger = []
-    
+
 if "benchmark_results" not in st.session_state:
     st.session_state.benchmark_results = []
+
+if "last_processed_audio_id" not in st.session_state:
+    st.session_state.last_processed_audio_id = None
 
 # --- Sidebar ---
 st.sidebar.title("🎙️ Habahub")
@@ -261,34 +263,51 @@ if page == "Record & Query":
     st.write("Speak a contribution, payment note, update — or ask a question about your account — in English, Swahili, or both.")
     audio = st.audio_input("Record your message")
 
-
     if audio is not None:
-        with open("temp_input.wav", "wb") as f:
-            f.write(audio.getvalue())
+        audio_bytes = audio.getvalue()
+        audio_id = hash(audio_bytes)
 
-        with st.spinner("Transcribing..."):
-            transcript = transcribe_sahara("temp_input.wav")
+        if st.session_state.last_processed_audio_id != audio_id:
+            st.session_state.last_processed_audio_id = audio_id
+
+            with open("temp_input.wav", "wb") as f:
+                f.write(audio_bytes)
+
+            with st.spinner("Transcribing..."):
+                transcript = transcribe_sahara("temp_input.wav")
+            st.session_state.current_transcript = transcript
+
+            with st.spinner("Running benchmark comparison..."):
+                try:
+                    whisper_result = transcribe_whisper_hf("temp_input.wav")
+                except Exception as e:
+                    whisper_result = f"[failed: {e}]"
+                try:
+                    mms_result = transcribe_mms("temp_input.wav")
+                except Exception as e:
+                    mms_result = f"[failed: {e}]"
+
+            st.session_state.benchmark_results.append({
+                "ground_truth": transcript,
+                "sahara": transcript,
+                "whisper": whisper_result,
+                "mms": mms_result
+            })
+
+            with st.spinner("Understanding your message..."):
+                intent = classify_intent(transcript)
+            st.session_state.current_intent = intent
+
+            if intent != "question":
+                with st.spinner("Extracting details..."):
+                    extracted_raw = extract_chama_action(transcript)
+                    extracted = json.loads(extracted_raw) if isinstance(extracted_raw, str) else extracted_raw
+                    extracted = validate_extraction(transcript, extracted)
+                st.session_state.current_extracted = extracted
+
+        transcript = st.session_state.current_transcript
+        intent = st.session_state.current_intent
         st.write("**Transcript:**", transcript)
-
-        with st.spinner("Running benchmark comparison..."):
-            try:
-                whisper_result = transcribe_whisper_hf("temp_input.wav")
-            except Exception as e:
-                whisper_result = f"[failed: {e}]"
-            try:
-                mms_result = transcribe_mms("temp_input.wav")
-            except Exception as e:
-                mms_result = f"[failed: {e}]"
-
-        st.session_state.benchmark_results.append({
-            "ground_truth": transcript,
-            "sahara": transcript,
-            "whisper": whisper_result,
-            "mms": mms_result
-        })
-
-        with st.spinner("Understanding your message..."):
-            intent = classify_intent(transcript)
 
         if intent == "question":
             with st.spinner("Checking records..."):
@@ -299,11 +318,8 @@ if page == "Record & Query":
             st.audio(audio_url)
 
         else:
-            with st.spinner("Extracting details..."):
-                extracted_raw = extract_chama_action(transcript)
-                extracted = json.loads(extracted_raw) if isinstance(extracted_raw, str) else extracted_raw
-                st.json(extracted)
-                extracted = validate_extraction(transcript, extracted)
+            extracted = st.session_state.current_extracted
+            st.json(extracted)
 
             if "_flag" in extracted:
                 st.warning(f"⚠️ {extracted['_flag']}")
@@ -425,7 +441,6 @@ elif page == "Benchmark":
             ])
             st.dataframe(comp_df, use_container_width=True, hide_index=True)
             st.divider()
-
 
 
 #     render_header("Benchmark")

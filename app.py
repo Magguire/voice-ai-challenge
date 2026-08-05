@@ -214,47 +214,47 @@ if audio is not None:
         st.write("**Confirmation:**", confirmation_text)
         st.audio(audio_url)
         
-    if needs_confirmation(extracted):
-        st.session_state.pending_confirmation = extracted
-        st.warning("This message was unclear.")
-        confirmation_question = generate_confirmation_question(extracted)
-        with st.spinner("Generating question..."):
-            question_audio_url = generate_tts(confirmation_question)
-        st.write("**Question:**", confirmation_question)
-        st.audio(question_audio_url)
-    else:
-        st.session_state.ledger.append(extracted)
-        confirmation_text = generate_confirmation_text(extracted)
-        with st.spinner("Generating spoken confirmation..."):
-            audio_url = generate_tts(confirmation_text)
-        st.write("**Confirmation:**", confirmation_text)
-        st.audio(audio_url)
+    # if needs_confirmation(extracted):
+    #     st.session_state.pending_confirmation = extracted
+    #     st.warning("This message was unclear.")
+    #     confirmation_question = generate_confirmation_question(extracted)
+    #     with st.spinner("Generating question..."):
+    #         question_audio_url = generate_tts(confirmation_question)
+    #     st.write("**Question:**", confirmation_question)
+    #     st.audio(question_audio_url)
+    # else:
+    #     st.session_state.ledger.append(extracted)
+    #     confirmation_text = generate_confirmation_text(extracted)
+    #     with st.spinner("Generating spoken confirmation..."):
+    #         audio_url = generate_tts(confirmation_text)
+    #     st.write("**Confirmation:**", confirmation_text)
+    #     st.audio(audio_url)
 
-if st.session_state.pending_confirmation is not None:
-    st.info("Please record your reply to the question above.")
-    reply_audio = st.audio_input("Record your reply", key="reply_input")
+# if st.session_state.pending_confirmation is not None:
+#     st.info("Please record your reply to the question above.")
+#     reply_audio = st.audio_input("Record your reply", key="reply_input")
 
-    if reply_audio is not None:
-        with open("temp_reply.wav", "wb") as f:
-            f.write(reply_audio.getvalue())
+#     if reply_audio is not None:
+#         with open("temp_reply.wav", "wb") as f:
+#             f.write(reply_audio.getvalue())
 
-        with st.spinner("Processing your reply..."):
-            reply_transcript = transcribe_sahara("temp_reply.wav")
-            reply_extracted_raw = extract_chama_action(reply_transcript)
-            reply_extracted = json.loads(reply_extracted_raw) if isinstance(reply_extracted_raw, str) else reply_extracted_raw
-            st.json(reply_extracted)  # same visibility for the reply path
-            reply_extracted = validate_extraction(reply_transcript, reply_extracted)
+#         with st.spinner("Processing your reply..."):
+#             reply_transcript = transcribe_sahara("temp_reply.wav")
+#             reply_extracted_raw = extract_chama_action(reply_transcript)
+#             reply_extracted = json.loads(reply_extracted_raw) if isinstance(reply_extracted_raw, str) else reply_extracted_raw
+#             st.json(reply_extracted)  # same visibility for the reply path
+#             reply_extracted = validate_extraction(reply_transcript, reply_extracted)
 
-        st.write("**Reply transcript:**", reply_transcript)
+#         st.write("**Reply transcript:**", reply_transcript)
 
-        st.session_state.ledger.append(reply_extracted)
-        confirmation_text = generate_confirmation_text(reply_extracted)
-        with st.spinner("Generating spoken confirmation..."):
-            audio_url = generate_tts(confirmation_text)
-        st.write("**Confirmation:**", confirmation_text)
-        st.audio(audio_url)
+#         st.session_state.ledger.append(reply_extracted)
+#         confirmation_text = generate_confirmation_text(reply_extracted)
+#         with st.spinner("Generating spoken confirmation..."):
+#             audio_url = generate_tts(confirmation_text)
+#         st.write("**Confirmation:**", confirmation_text)
+#         st.audio(audio_url)
 
-        st.session_state.pending_confirmation = None
+#         st.session_state.pending_confirmation = None
 
 
 st.divider()

@@ -4,3 +4,4 @@ groq
 torch
 transformers
 torchaudio
+torchvision

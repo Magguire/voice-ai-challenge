@@ -71,8 +71,8 @@ def transcribe_whisper_hf(audio_path):
 def load_mms_model():
     from transformers import Wav2Vec2ForCTC, AutoProcessor
     model_id = "facebook/mms-1b-all"
-    processor = AutoProcessor.from_pretrained(model_id, target_lang="swh")
-    model = Wav2Vec2ForCTC.from_pretrained(model_id, target_lang="swh", ignore_mismatched_sizes=True)
+    processor = AutoProcessor.from_pretrained(model_id, target_lang="swh", token=HF_API_KEY)
+    model = Wav2Vec2ForCTC.from_pretrained(model_id, target_lang="swh", ignore_mismatched_sizes=True, token=HF_API_KEY)
     return processor, model
 
 def transcribe_mms(audio_path):

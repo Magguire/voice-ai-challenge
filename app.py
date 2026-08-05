@@ -206,11 +206,18 @@ def generate_confirmation_text(entry):
     return text
 
 
+import string
+
 def word_accuracy(ground_truth, model_output):
     if not model_output or model_output.startswith("[failed"):
         return 0.0
-    gt_words = set(ground_truth.lower().split())
-    model_words = set(model_output.lower().split())
+
+    def clean_words(text):
+        text = text.lower().translate(str.maketrans("", "", string.punctuation))
+        return set(text.split())
+
+    gt_words = clean_words(ground_truth)
+    model_words = clean_words(model_output)
     if not gt_words:
         return 0.0
     correct = len(gt_words & model_words)
@@ -390,12 +397,26 @@ elif page == "Benchmark":
     else:
         for i, entry in enumerate(st.session_state.benchmark_results):
             st.markdown(f"**Recording {i+1}**")
-            edited_gt = st.text_area(f"Ground truth (edit if incorrect) — Recording {i+1}", value=entry["ground_truth"], key=f"gt_{i}")
-            st.session_state.benchmark_results[i]["ground_truth"] = edited_gt
 
-            sahara_acc = word_accuracy(edited_gt, entry["sahara"])
-            whisper_acc = word_accuracy(edited_gt, entry["whisper"])
-            mms_acc = word_accuracy(edited_gt, entry["mms"])
+            col1, col2 = st.columns([5, 1])
+            with col1:
+                gt_input = st.text_area(
+                    f"Ground truth — Recording {i+1}",
+                    value=entry["ground_truth"],
+                    key=f"gt_input_{i}",
+                    label_visibility="collapsed"
+                )
+            with col2:
+                st.write("")  # spacer to align button with text area
+                if st.button("Update", key=f"update_btn_{i}"):
+                    st.session_state.benchmark_results[i]["ground_truth"] = gt_input
+                    st.rerun()
+
+            applied_gt = st.session_state.benchmark_results[i]["ground_truth"]
+
+            sahara_acc = word_accuracy(applied_gt, entry["sahara"])
+            whisper_acc = word_accuracy(applied_gt, entry["whisper"])
+            mms_acc = word_accuracy(applied_gt, entry["mms"])
 
             comp_df = pd.DataFrame([
                 {"Model": "Sahara", "Transcript": entry["sahara"], "Word Accuracy": f"{sahara_acc}%"},
@@ -404,7 +425,6 @@ elif page == "Benchmark":
             ])
             st.dataframe(comp_df, use_container_width=True, hide_index=True)
             st.divider()
-
 
 
 

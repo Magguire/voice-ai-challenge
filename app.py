@@ -2,6 +2,7 @@ import streamlit as st
 import requests
 import json
 from groq import Groq
+import re
 
 # --- Load keys from Streamlit secrets (set these in Streamlit Cloud's secrets manager, not hardcoded) ---
 SAHARA_API_KEY = st.secrets["SAHARA_API_KEY"]
@@ -24,6 +25,29 @@ def transcribe_sahara(audio_path, language="sw"):
     except requests.exceptions.JSONDecodeError:
         raise Exception(f"Sahara returned non-JSON response: {response.text[:300]}")
 
+
+NUMBER_WORDS = [
+    # English
+    "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
+    "hundred", "thousand", "million",
+    # Swahili
+    "moja", "mbili", "tatu", "nne", "tano", "sita", "saba", "nane", "tisa", "kumi",
+    "ishirini", "thelathini", "arobaini", "hamsini", "sitini", "sabini", "themanini", "tisini",
+    "mia", "elfu", "milioni"
+]
+
+def validate_extraction(transcript, extracted):
+    if extracted.get("amount") is not None:
+        transcript_lower = transcript.lower()
+        has_digit = bool(re.search(r'\d', transcript))
+        has_number_word = any(word in transcript_lower for word in NUMBER_WORDS)
+        if not has_digit and not has_number_word:
+            extracted["_original_amount_before_validation"] = extracted["amount"]
+            extracted["amount"] = None
+            extracted["_flag"] = "amount removed: no digit or number word found in transcript"
+    extracted.pop("reasoning", None)  # drop scratchpad before logging to ledger
+    return extracted
+
 def extract_chama_action(transcript):
     prompt = f"""You are extracting structured data from a chama (savings group) voice message.
 The message may mix English and Swahili. The speaker is usually reporting their own action,
@@ -32,31 +56,29 @@ and may separately reference another member.
 CRITICAL RULES:
 - Only extract information explicitly stated. Do NOT infer or guess missing values.
 - If no amount is mentioned, amount must be null — never 0, never invented, never a small placeholder number.
+- Amounts may be stated as digits (e.g. "2000") or as words (e.g. "elfu mbili" / "two thousand"). Both are valid.
 - If the speaker uses future tense (e.g. "nitatuma" / "I will send") without saying they already paid, this is NOT a completed deposit.
 - Vague quantity words (e.g. "kidogo" / "a little" / "some") are NOT numbers. Never convert them into a numeric guess.
 - referenced_member must be an actual person's name, never a number or group description. If none, use "none".
 
 Example 1:
 Transcript: "Nimechelewa mwezi huu lakini nitatuma kiasi chote Ijumaa ijayo."
-Correct extraction: {{"speaker_action": "late_payment_note", "amount": null, "referenced_member": "none", "referenced_member_context": "none", "action_type": "late_payment_note"}}
-(Reasoning: "nimechelewa" = I am late; "nitatuma" = I will send, future tense, not yet paid; no amount stated.)
+Correct extraction: {{"reasoning": "Speaker is reporting their own status. Future tense 'nitatuma' means not yet paid. No amount stated in digits or words.", "speaker_action": "late_payment_note", "amount": null, "referenced_member": "none", "referenced_member_context": "none", "action_type": "late_payment_note"}}
 
 Example 2:
 Transcript: "Nimetuma pesa kidogo leo."
-Correct extraction: {{"speaker_action": "deposit", "amount": null, "referenced_member": "none", "referenced_member_context": "none", "action_type": "deposit"}}
-(Reasoning: "kidogo" means "a little/some" — a vague qualifier, not a specific number. Never convert vague quantity words into a numeric guess.)
+Correct extraction: {{"reasoning": "Speaker completed an action ('nimetuma'). 'Kidogo' is a vague qualifier, not a digit or number word, so no real amount was stated.", "speaker_action": "deposit", "amount": null, "referenced_member": "none", "referenced_member_context": "none", "action_type": "deposit"}}
 
 Now extract from this transcript:
 Transcript: "{transcript}"
 
-Extract exactly these five fields as JSON:
-- speaker_action: one of "deposit", "payout_received", "late_payment_note", "membership_update", "other"
-- amount: numeric amount, or null if none stated
-- referenced_member: another person's name, or "none"
-- referenced_member_context: brief reason, or "none"
-- action_type: one of "deposit", "payout", "late_payment_note", "membership_update", "other"
+First, in "reasoning", briefly state: (a) who is speaking, (b) what tense/timing they use,
+(c) whether they personally took a financial action or only mentioned someone else's,
+(d) whether an amount was stated as digits, as words, or not stated at all.
+Then extract the five fields, matching your reasoning.
 
-Respond with ONLY valid JSON, no other text."""
+Respond with ONLY valid JSON in this exact structure, no other text:
+{{"reasoning": "...", "speaker_action": "...", "amount": ..., "referenced_member": "...", "referenced_member_context": "...", "action_type": "..."}}"""
 
     response = groq_client.chat.completions.create(
         model="llama-3.1-8b-instant",

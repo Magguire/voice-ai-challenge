@@ -186,16 +186,27 @@ st.sidebar.markdown(f"**{CURRENT_USER}** {'(Admin)' if IS_ADMIN else ''}")
 st.sidebar.divider()
 page = st.sidebar.radio("Navigate", ["Record & Query", "Dashboard"])
 
+def render_header(title):
+    col1, col2 = st.columns([5, 1])
+    with col1:
+        st.title(title)
+    with col2:
+        st.write("")  # vertical spacer to align with title
+        with st.popover(f"👤 {CURRENT_USER}"):
+            st.write(f"**{CURRENT_USER}**")
+            st.caption("Admin" if IS_ADMIN else "Member")
+            st.divider()
+            st.button("Log out", disabled=True, help="Demo only — not functional")
+
 # ============================================================
 # PAGE 1: Record & Query
 # ============================================================
 if page == "Record & Query":
-    st.title("Record & Query")
+    render_header("Record & Query")
     st.write("Speak a contribution, payment note, update — or ask a question about your account — in English, Swahili, or both.")
-
-    speaking_as = st.selectbox("Who's speaking?", list(MOCK_MEMBERS.keys()), index=list(MOCK_MEMBERS.keys()).index(CURRENT_USER))
-
     audio = st.audio_input("Record your message")
+    
+    speaking_as = CURRENT_USER
 
     if audio is not None:
         with open("temp_input.wav", "wb") as f:
@@ -270,7 +281,7 @@ if page == "Record & Query":
 # PAGE 2: Dashboard
 # ============================================================
 elif page == "Dashboard":
-    st.title("Dashboard")
+    render_header("Dashboard")
     st.caption("⚠️ Illustrative demo data — not live transaction history.")
 
     total_ytd = sum(m["ytd_contributed"] for m in MOCK_MEMBERS.values())

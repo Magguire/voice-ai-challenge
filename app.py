@@ -57,15 +57,12 @@ def transcribe_sahara(audio_path, language="sw"):
 
 
 
+from huggingface_hub import InferenceClient
+
 def transcribe_whisper_hf(audio_path):
-    api_url = "https://router.huggingface.co/hf-inference/models/openai/whisper-small"
-    headers = {"Authorization": f"Bearer {HF_API_KEY}"}
-    with open(audio_path, "rb") as f:
-        data = f.read()
-    response = requests.post(api_url, headers=headers, data=data, timeout=60)
-    if response.status_code != 200:
-        raise Exception(f"HF Whisper API error {response.status_code}: {response.text[:300]}")
-    return response.json().get("text", "")
+    client = InferenceClient(provider="fal-ai", api_key=HF_API_KEY)
+    result = client.automatic_speech_recognition(audio_path, model="openai/whisper-large-v3")
+    return result.text
 
 @st.cache_resource
 def load_mms_model():

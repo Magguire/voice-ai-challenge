@@ -103,15 +103,24 @@ def validate_extraction(transcript, extracted):
     return extracted
 
 
-def needs_confirmation(extracted):
-    return "_flag" in extracted or "_flag_invalid_speaker_action" in extracted
-
 def generate_tts(text, voice_accent="swahili", voice_gender="female", voice_language="en"):
     url = "https://infer.voice.intron.io/tts/v1/generate"
     headers = {"Authorization": f"Bearer {SAHARA_API_KEY}", "Content-Type": "application/json"}
     payload = {"text": text, "voice_accent": voice_accent, "voice_gender": voice_gender, "voice_language": voice_language}
     response = requests.post(url, headers=headers, json=payload)
     return response.json()["data"]["audio_path"]
+
+
+def generate_confirmation_question(extracted):
+    if "_flag" in extracted:
+        return "I heard an unclear amount. Could you please repeat how much money was involved?"
+    elif "_flag_invalid_speaker_action" in extracted:
+        return "I couldn't clearly understand the action you're reporting. Could you please repeat your message?"
+    else:
+        return "Could you please confirm or repeat your message?"
+
+def needs_confirmation(extracted):
+    return "_flag" in extracted or "_flag_invalid_speaker_action" in extracted
 
 def generate_confirmation_text(entry):
     if entry["speaker_action"] == "deposit":
@@ -136,6 +145,9 @@ if "ledger" not in st.session_state:
 
 audio = st.audio_input("Record your message")
 
+if "pending_confirmation" not in st.session_state:
+    st.session_state.pending_confirmation = None
+
 if audio is not None:
     with open("temp_input.wav", "wb") as f:
         f.write(audio.getvalue())
@@ -145,16 +157,18 @@ if audio is not None:
     st.write("**Transcript:**", transcript)
 
     with st.spinner("Extracting details..."):
-        extracted = extract_chama_action(transcript)
-    st.json(extracted)
-    
+        extracted_raw = extract_chama_action(transcript)
+        extracted = json.loads(extracted_raw) if isinstance(extracted_raw, str) else extracted_raw
+        extracted = validate_extraction(transcript, extracted)
+
     if needs_confirmation(extracted):
-        st.warning("This message was unclear. Confirmation step needed.")
-        confirmation_question = generate_confirmation_question(extracted)  # not yet written
+        st.session_state.pending_confirmation = extracted
+        st.warning("This message was unclear.")
+        confirmation_question = generate_confirmation_question(extracted)
         with st.spinner("Generating question..."):
             question_audio_url = generate_tts(confirmation_question)
+        st.write("**Question:**", confirmation_question)
         st.audio(question_audio_url)
-        # second st.audio_input and re-processing logic goes here — not yet written
     else:
         st.session_state.ledger.append(extracted)
         confirmation_text = generate_confirmation_text(extracted)
@@ -162,6 +176,31 @@ if audio is not None:
             audio_url = generate_tts(confirmation_text)
         st.write("**Confirmation:**", confirmation_text)
         st.audio(audio_url)
+
+if st.session_state.pending_confirmation is not None:
+    st.info("Please record your reply to the question above.")
+    reply_audio = st.audio_input("Record your reply", key="reply_input")
+
+    if reply_audio is not None:
+        with open("temp_reply.wav", "wb") as f:
+            f.write(reply_audio.getvalue())
+
+        with st.spinner("Processing your reply..."):
+            reply_transcript = transcribe_sahara("temp_reply.wav")
+            reply_extracted_raw = extract_chama_action(reply_transcript)
+            reply_extracted = json.loads(reply_extracted_raw) if isinstance(reply_extracted_raw, str) else reply_extracted_raw
+            reply_extracted = validate_extraction(reply_transcript, reply_extracted)
+
+        st.write("**Reply transcript:**", reply_transcript)
+
+        st.session_state.ledger.append(reply_extracted)
+        confirmation_text = generate_confirmation_text(reply_extracted)
+        with st.spinner("Generating spoken confirmation..."):
+            audio_url = generate_tts(confirmation_text)
+        st.write("**Confirmation:**", confirmation_text)
+        st.audio(audio_url)
+
+        st.session_state.pending_confirmation = None
 
 
 st.divider()

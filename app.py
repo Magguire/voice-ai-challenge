@@ -6,6 +6,8 @@ import re
 import pandas as pd
 import torch
 import string
+import calendar
+from datetime import date
 
 SAHARA_API_KEY = st.secrets["SAHARA_API_KEY"]
 GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
@@ -21,7 +23,7 @@ NUMBER_WORDS = [
     "mia", "elfu", "milioni"
 ]
 SCALE_WORDS = ["elfu", "mia", "thousand", "hundred", "milioni", "million"]
-VALID_SPEAKER_ACTIONS = {"deposit", "payout_received", "initiate_payout", "late_payment_note", "membership_update", "loan_request", "other"}
+VALID_SPEAKER_ACTIONS = {"deposit", "payout_received", "initiate_scheduled_payout", "initiate_loan_payout", "late_payment_note", "membership_update", "loan_request", "other"}
 
 ADMIN_ALLOWED_ACTIONS = VALID_SPEAKER_ACTIONS
 MEMBER_ALLOWED_ACTIONS = {"deposit", "payout_received", "late_payment_note", "loan_request", "other"}
@@ -46,12 +48,59 @@ MOCK_MEMBERS = {
     "Juma":   {"ytd_contributed": 12000, "this_month_paid": True,  "last_paid": "2026-08-01", "owed": 0,     "loan_eligible": 8000,  "payout_position": 6},
 }
 
+MONTHS_FULL = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
 MOCK_MONTHLY_TOTALS = pd.DataFrame({
-    "Month": ["Mar", "Apr", "May", "Jun", "Jul", "Aug"],
-    "Collected": [18000, 19500, 21000, 20500, 22000, 21000]
+    "Month": MONTHS_FULL,
+    "Collected": [13000, 15000, 18000, 19500, 21000, 20500, 22000, 21000, 0, 0, 0, 0]
 })
 
-CURRENT_PAYOUT_POSITION = 3
+MOCK_MEMBER_MONTHLY = {
+    name: [round(data["ytd_contributed"] / 8)] * 8 + [0, 0, 0, 0]
+    for name, data in MOCK_MEMBERS.items()
+}
+
+SCHEDULE_START_YEAR = 2026
+SCHEDULE_START_MONTH = 8  # payouts begin at end of August 2026
+
+
+def get_member_by_position(position):
+    for name, data in MOCK_MEMBERS.items():
+        if data["payout_position"] == position:
+            return name
+    return None
+
+
+def compute_date_for_offset(offset_months):
+    """Given an offset from the schedule start, return the last day of that month as a date object."""
+    month_index = SCHEDULE_START_MONTH - 1 + offset_months
+    year = SCHEDULE_START_YEAR + month_index // 12
+    month = month_index % 12 + 1
+    last_day = calendar.monthrange(year, month)[1]
+    return date(year, month, last_day)
+
+
+def build_initial_schedule():
+    positions_sorted = sorted(MOCK_MEMBERS.items(), key=lambda x: x[1]["payout_position"])
+    schedule = {data["payout_position"]: compute_date_for_offset(i) for i, (name, data) in enumerate(positions_sorted)}
+    schedule[1] = date.today()  # override: position 1's payout is due today, for demo purposes
+    return schedule
+
+if "payout_schedule" not in st.session_state:
+    st.session_state.payout_schedule = build_initial_schedule()
+
+if "payouts_made_positions" not in st.session_state:
+    st.session_state.payouts_made_positions = set()
+
+if "simulated_today" not in st.session_state:
+    st.session_state.simulated_today = date.today()
+
+
+def get_pending_loan_for_member(member_name):
+    for lr in st.session_state.loan_requests:
+        if lr["member"] == member_name and lr["status"] == "pending":
+            return lr
+    return None
 
 
 def transcribe_sahara(audio_path, language="sw"):
@@ -100,8 +149,9 @@ def classify_intent(transcript):
     prompt = f"""Classify this chama voice message as either "statement" or "question".
 
 "statement" includes: reporting a completed or future action (deposit, payment), requesting a loan
-(e.g. "I want to borrow...", "Naomba mkopo..."), requesting a payout be sent, or any message where the
-speaker wants an action taken or recorded — even if phrased politely as a request.
+(e.g. "I want to borrow...", "Naomba mkopo..."), requesting a scheduled payout be sent, approving a loan
+payout for another member, or any message where the speaker wants an action taken or recorded —
+even if phrased politely as a request.
 
 "question" is ONLY for messages purely seeking information with no action requested
 (e.g. "When is my turn?", "How much do I owe?", "Nimechangia kiasi gani?").
@@ -153,8 +203,9 @@ CRITICAL RULES:
 - If the speaker uses future tense (e.g. "nitatuma" / "I will send") without saying they already paid, this is NOT a completed deposit.
 - Vague quantity words (e.g. "kidogo" / "a little" / "some") are NOT numbers. Never convert them into a numeric guess.
 - referenced_member must be an actual person's name, never a number or group description. If none, use "none".
-- If the speaker is COMMANDING money be sent to someone else (e.g. "Tuma X kwa Y"), this is "initiate_payout", not "payout_received".
+- If the speaker is COMMANDING a regular scheduled payout be sent to a member (e.g. "Tuma X kwa Y"), this is "initiate_scheduled_payout".
 - If the speaker is asking to BORROW money for themselves, this is "loan_request".
+- If the speaker (an admin) is APPROVING or releasing an already-requested loan payout for another member (e.g. "Approve mkopo wa Juma", "Send Juma's loan"), this is "initiate_loan_payout" — distinct from a scheduled payout.
 
 Example 1:
 Transcript: "Nimechelewa mwezi huu lakini nitatuma kiasi chote Ijumaa ijayo."
@@ -166,11 +217,15 @@ Correct extraction: {{"reasoning": "Speaker completed an action ('nimetuma'). 'K
 
 Example 3:
 Transcript: "Tuma elfu mbili kwa Grace leo."
-Correct extraction: {{"reasoning": "Speaker is issuing a command to send money to another member — this is initiating a payout, not reporting one received.", "speaker_action": "initiate_payout", "amount": 2000, "referenced_member": "Grace", "referenced_member_context": "payout recipient", "action_type": "payout"}}
+Correct extraction: {{"reasoning": "Speaker is issuing a command to send a scheduled payout to another member.", "speaker_action": "initiate_scheduled_payout", "amount": 2000, "referenced_member": "Grace", "referenced_member_context": "payout recipient", "action_type": "payout"}}
 
 Example 4:
 Transcript: "Naomba mkopo wa elfu tano."
 Correct extraction: {{"reasoning": "Speaker is requesting to borrow money for themselves from the group.", "speaker_action": "loan_request", "amount": 5000, "referenced_member": "none", "referenced_member_context": "none", "action_type": "other"}}
+
+Example 5:
+Transcript: "Approve mkopo wa Juma."
+Correct extraction: {{"reasoning": "Speaker (admin) is approving and releasing an existing loan payout for another member, not a scheduled payout.", "speaker_action": "initiate_loan_payout", "amount": null, "referenced_member": "Juma", "referenced_member_context": "loan payout approval", "action_type": "payout"}}
 
 Now extract from this transcript:
 Transcript: "{transcript}"
@@ -211,13 +266,36 @@ def validate_extraction(transcript, extracted):
     return extracted
 
 
-def check_payout_eligibility(member_name, amount):
+def check_scheduled_payout_eligibility(member_name, amount):
+    """Checks: is it actually this member's scheduled turn, has today reached that date, has it already been paid."""
     member = MOCK_MEMBERS.get(member_name)
     if not member:
         return False, f"{member_name} is not a registered member."
-    if member["payout_position"] != CURRENT_PAYOUT_POSITION:
-        return False, f"{member_name} is not scheduled to receive a payout this month. It is currently position {CURRENT_PAYOUT_POSITION}'s turn."
-    return True, f"{member_name} is eligible. [SIMULATED] Would send {amount} to their registered phone number."
+
+    position = member["payout_position"]
+    scheduled_date = st.session_state.payout_schedule[position]
+    today = st.session_state.simulated_today
+
+    if position in st.session_state.payouts_made_positions:
+        return False, f"{member_name}'s payout for {scheduled_date.strftime('%d/%m/%Y')} has already been made."
+
+    if today < scheduled_date:
+        return False, f"{member_name} is not due yet. Scheduled date is {scheduled_date.strftime('%d/%m/%Y')}, today is {today.strftime('%d/%m/%Y')}."
+
+    return True, f"{member_name} is eligible — scheduled date {scheduled_date.strftime('%d/%m/%Y')} has been reached. [SIMULATED] Would send {amount} to their registered phone number."
+
+
+def mark_scheduled_payout_made(member_name):
+    """Marks the payout as made and advances that position's schedule by one full rotation."""
+    member = MOCK_MEMBERS.get(member_name)
+    position = member["payout_position"]
+    st.session_state.payouts_made_positions.add(position)
+    num_members = len(MOCK_MEMBERS)
+    old_date = st.session_state.payout_schedule[position]
+    old_offset = (old_date.year - SCHEDULE_START_YEAR) * 12 + (old_date.month - SCHEDULE_START_MONTH)
+    new_offset = old_offset + num_members
+    st.session_state.payout_schedule[position] = compute_date_for_offset(new_offset)
+    st.session_state.payouts_made_positions.discard(position)
 
 
 def check_loan_eligibility(member_name, amount):
@@ -242,10 +320,12 @@ def generate_confirmation_text(entry):
         text = f"Confirmed: deposit of {entry['amount']} logged."
         if entry["referenced_member"] != "none":
             text += f" Noted: {entry['referenced_member']} — {entry['referenced_member_context']}."
-    elif entry["speaker_action"] == "initiate_payout":
-        text = f"Processing payout request for {entry['referenced_member']}."
+    elif entry["speaker_action"] == "initiate_scheduled_payout":
+        text = f"Checking scheduled payout for {entry['referenced_member']}."
+    elif entry["speaker_action"] == "initiate_loan_payout":
+        text = f"Checking loan payout for {entry['referenced_member']}."
     elif entry["speaker_action"] == "loan_request":
-        text = f"Loan request of {entry['amount']} recorded, pending admin approval."
+        text = f"Your loan request for {entry['amount']} is ready. Please confirm below to submit it for admin approval."
     elif entry["speaker_action"] == "late_payment_note":
         text = "Noted: you'll be sending your payment late. No amount logged yet."
     elif entry["speaker_action"] == "membership_update":
@@ -281,6 +361,8 @@ if "last_processed_audio_id" not in st.session_state:
     st.session_state.last_processed_audio_id = None
 if "loan_requests" not in st.session_state:
     st.session_state.loan_requests = []
+if "pending_loan_review" not in st.session_state:
+    st.session_state.pending_loan_review = None
 
 st.sidebar.title("🎙️ Habahub")
 st.sidebar.markdown(f"**{CURRENT_USER}** ({'Admin' if IS_ADMIN else 'Member'})")
@@ -420,15 +502,33 @@ if page == "Record & Query":
 
                     confirmation_text = generate_confirmation_text(final_entry)
 
-                    if edited_speaker_action == "initiate_payout" and IS_ADMIN and edited_referenced_member not in ("none", ""):
-                        eligible, elig_message = check_payout_eligibility(edited_referenced_member, edited_amount)
+                    if edited_speaker_action == "initiate_scheduled_payout" and IS_ADMIN and edited_referenced_member not in ("none", ""):
+                        eligible, elig_message = check_scheduled_payout_eligibility(edited_referenced_member, edited_amount)
                         ai_action_taken = True
                         if eligible:
+                            mark_scheduled_payout_made(edited_referenced_member)
                             st.success(f"✅ SIMULATED PAYMENT — {elig_message}")
-                            confirmation_text += f" Payment of {edited_amount} sent to {edited_referenced_member}. Simulated transaction — no real funds moved."
+                            confirmation_text += f" Payment of {edited_amount} sent to {edited_referenced_member}. Simulated transaction — no real funds moved. Their schedule has been updated to the next cycle."
                         else:
                             st.error(f"❌ Payment blocked (simulated check) — {elig_message}")
                             confirmation_text += f" Payment blocked. {elig_message}"
+
+                    if edited_speaker_action == "initiate_loan_payout" and IS_ADMIN and edited_referenced_member not in ("none", ""):
+                        ai_action_taken = True
+                        pending_loan = get_pending_loan_for_member(edited_referenced_member)
+                        if not pending_loan:
+                            st.error(f"❌ No pending loan request found for {edited_referenced_member}.")
+                            confirmation_text += f" No pending loan request found for {edited_referenced_member}."
+                        else:
+                            eligible, elig_message = check_loan_eligibility(edited_referenced_member, pending_loan["amount"])
+                            idx = st.session_state.loan_requests.index(pending_loan)
+                            if eligible:
+                                st.session_state.loan_requests[idx]["status"] = "approved"
+                                st.success(f"✅ SIMULATED LOAN PAYMENT — {elig_message}")
+                                confirmation_text += f" Loan payout of {pending_loan['amount']} approved and simulated as sent to {edited_referenced_member}."
+                            else:
+                                st.error(f"❌ Loan payout blocked — {elig_message}")
+                                confirmation_text += f" Loan payout blocked. {elig_message}"
 
                     final_entry["ai_action_taken"] = ai_action_taken
                     st.session_state.ledger.append(final_entry)
@@ -444,7 +544,7 @@ if page == "Record & Query":
                     st.write("**Confirmation:**", confirmation_text)
                     st.audio(audio_url)
 
-            if "pending_loan_review" in st.session_state and st.session_state.pending_loan_review:
+            if st.session_state.pending_loan_review:
                 st.divider()
                 st.subheader("Confirm loan request")
                 lr = st.session_state.pending_loan_review
@@ -475,9 +575,16 @@ elif page == "Dashboard":
     st.caption("⚠️ Illustrative demo data — not live transaction history.")
 
     if IS_ADMIN:
+        with st.expander("🛠️ Demo controls"):
+            st.caption("Real 'today' is before the first scheduled payout date, so this lets you simulate a later date to demo payout eligibility live. Not a real clock override.")
+            new_sim_date = st.date_input("Simulate current date", value=st.session_state.simulated_today)
+            if new_sim_date != st.session_state.simulated_today:
+                st.session_state.simulated_today = new_sim_date
+                st.rerun()
+
         total_ytd = sum(m["ytd_contributed"] for m in MOCK_MEMBERS.values())
-        this_month = MOCK_MONTHLY_TOTALS["Collected"].iloc[-1]
-        last_month = MOCK_MONTHLY_TOTALS["Collected"].iloc[-2]
+        this_month = MOCK_MONTHLY_TOTALS["Collected"].iloc[7]
+        last_month = MOCK_MONTHLY_TOTALS["Collected"].iloc[6]
         paid_this_month = sum(1 for m in MOCK_MEMBERS.values() if m["this_month_paid"])
 
         col1, col2, col3, col4 = st.columns(4)
@@ -486,7 +593,8 @@ elif page == "Dashboard":
         col3.metric("Members paid this month", f"{paid_this_month}/{len(MOCK_MEMBERS)}")
         col4.metric("Total owed to group", f"KES {sum(m['owed'] for m in MOCK_MEMBERS.values()):,}")
 
-        st.subheader("Monthly collections")
+        st.subheader("Monthly collections (Jan–Dec)")
+        st.caption("Future months (Sep–Dec) shown as 0 until recorded.")
         st.bar_chart(MOCK_MONTHLY_TOTALS.set_index("Month"))
 
         st.subheader("Member contributions")
@@ -499,42 +607,59 @@ elif page == "Dashboard":
 
         st.subheader("Payout rotation order")
         rotation_df = pd.DataFrame([
-            {"Position": v["payout_position"], "Member": name}
+            {"Position": v["payout_position"], "Member": name, "Scheduled Date": st.session_state.payout_schedule[v["payout_position"]].strftime("%d/%m/%Y")}
             for name, v in MOCK_MEMBERS.items()
         ]).sort_values("Position")
         st.dataframe(rotation_df, use_container_width=True, hide_index=True)
 
-        st.subheader("Pending loan requests")
-        pending = [lr for lr in st.session_state.loan_requests if lr["status"] == "pending"]
-        if not pending:
-            st.info("No pending loan requests.")
-        else:
-            for idx, lr in enumerate(st.session_state.loan_requests):
-                if lr["status"] != "pending":
-                    continue
-                col1, col2, col3 = st.columns([3, 2, 2])
-                col1.write(f"**{lr['member']}** requests **{lr['amount']}**")
-                if col2.button("Approve", key=f"approve_{idx}"):
-                    eligible, elig_message = check_loan_eligibility(lr["member"], lr["amount"])
-                    if eligible:
-                        st.session_state.loan_requests[idx]["status"] = "approved"
-                        st.session_state.ledger.append({
-                            "speaker": CURRENT_USER,
-                            "speaker_action": "initiate_payout",
-                            "amount": lr["amount"],
-                            "referenced_member": lr["member"],
-                            "referenced_member_context": "loan approval",
-                            "action_type": "payout",
-                            "amended_by_human": False,
-                            "ai_action_taken": True
-                        })
-                        st.success(f"✅ SIMULATED LOAN PAYMENT — {elig_message}")
+        st.subheader("Loan requests")
+        tab_pending, tab_approved, tab_rejected = st.tabs(["Pending", "Approved", "Rejected"])
+
+        with tab_pending:
+            pending = [lr for lr in st.session_state.loan_requests if lr["status"] == "pending"]
+            if not pending:
+                st.info("No pending loan requests.")
+            else:
+                for idx, lr in enumerate(st.session_state.loan_requests):
+                    if lr["status"] != "pending":
+                        continue
+                    col1, col2, col3 = st.columns([3, 2, 2])
+                    col1.write(f"**{lr['member']}** requests **{lr['amount']}**")
+                    if col2.button("Approve", key=f"approve_{idx}"):
+                        eligible, elig_message = check_loan_eligibility(lr["member"], lr["amount"])
+                        if eligible:
+                            st.session_state.loan_requests[idx]["status"] = "approved"
+                            st.session_state.ledger.append({
+                                "speaker": CURRENT_USER,
+                                "speaker_action": "initiate_loan_payout",
+                                "amount": lr["amount"],
+                                "referenced_member": lr["member"],
+                                "referenced_member_context": "loan approval",
+                                "action_type": "payout",
+                                "amended_by_human": False,
+                                "ai_action_taken": True
+                            })
+                            st.success(f"✅ SIMULATED LOAN PAYMENT — {elig_message}")
+                            st.rerun()
+                        else:
+                            st.error(f"❌ {elig_message}")
+                    if col3.button("Reject", key=f"reject_{idx}"):
+                        st.session_state.loan_requests[idx]["status"] = "rejected"
                         st.rerun()
-                    else:
-                        st.error(f"❌ {elig_message}")
-                if col3.button("Reject", key=f"reject_{idx}"):
-                    st.session_state.loan_requests[idx]["status"] = "rejected"
-                    st.rerun()
+
+        with tab_approved:
+            approved = [lr for lr in st.session_state.loan_requests if lr["status"] == "approved"]
+            if not approved:
+                st.info("No approved loan requests yet.")
+            else:
+                st.dataframe(pd.DataFrame(approved), use_container_width=True, hide_index=True)
+
+        with tab_rejected:
+            rejected = [lr for lr in st.session_state.loan_requests if lr["status"] == "rejected"]
+            if not rejected:
+                st.info("No rejected loan requests.")
+            else:
+                st.dataframe(pd.DataFrame(rejected), use_container_width=True, hide_index=True)
 
     else:
         my_data = MOCK_MEMBERS.get(CURRENT_USER, {})
@@ -545,7 +670,18 @@ elif page == "Dashboard":
         col3.metric("Amount owed", f"KES {my_data.get('owed', 0):,}")
         st.write(f"**Last paid:** {my_data.get('last_paid', 'N/A')}")
         st.write(f"**Loan eligible up to:** KES {my_data.get('loan_eligible', 0):,}")
-        st.write(f"**Your payout position:** {my_data.get('payout_position', 'N/A')} (current turn: position {CURRENT_PAYOUT_POSITION})")
+
+        my_position = my_data.get('payout_position')
+        my_date = st.session_state.payout_schedule.get(my_position)
+        st.write(f"**Your payout position:** {my_position} (scheduled: {my_date.strftime('%d/%m/%Y') if my_date else 'N/A'})")
+
+        st.subheader("Your monthly contributions")
+        st.caption("Future months (Sep–Dec) shown as 0 until recorded.")
+        my_monthly_df = pd.DataFrame({
+            "Month": MONTHS_FULL,
+            "Contributed": MOCK_MEMBER_MONTHLY.get(CURRENT_USER, [0]*12)
+        })
+        st.bar_chart(my_monthly_df.set_index("Month"))
 
         st.subheader("Your loan requests")
         my_loans = [lr for lr in st.session_state.loan_requests if lr["member"] == CURRENT_USER]

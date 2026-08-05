@@ -15,7 +15,14 @@ def transcribe_sahara(audio_path, language="sw"):
     files = {"audio_file_blob": open(audio_path, "rb")}
     data = {"audio_file_name": audio_path, "use_language_asr_input": language}
     response = requests.post(url, headers=headers, files=files, data=data)
-    return response.json()["data"]["audio_transcript"]
+
+    if response.status_code != 200:
+        raise Exception(f"Sahara API error {response.status_code}: {response.text[:300]}")
+
+    try:
+        return response.json()["data"]["audio_transcript"]
+    except requests.exceptions.JSONDecodeError:
+        raise Exception(f"Sahara returned non-JSON response: {response.text[:300]}")
 
 def extract_chama_action(transcript):
     prompt = f"""You are extracting structured data from a chama (savings group) voice message.

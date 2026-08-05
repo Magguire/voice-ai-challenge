@@ -184,7 +184,7 @@ if "ledger" not in st.session_state:
 st.sidebar.title("🎙️ Habahub")
 st.sidebar.markdown(f"**{CURRENT_USER}** {'(Admin)' if IS_ADMIN else ''}")
 st.sidebar.divider()
-page = st.sidebar.radio("Navigate", ["Record & Query", "Dashboard"])
+page = st.sidebar.radio("Navigate", ["Dashboard", "Record & Query", "Benchmark"])
 
 def render_header(title):
     col1, col2 = st.columns([5, 1])
@@ -198,6 +198,8 @@ def render_header(title):
             st.divider()
             st.button("Log out", disabled=True, help="Demo only — not functional")
 
+speaking_as = CURRENT_USER
+
 # ============================================================
 # PAGE 1: Record & Query
 # ============================================================
@@ -206,7 +208,6 @@ if page == "Record & Query":
     st.write("Speak a contribution, payment note, update — or ask a question about your account — in English, Swahili, or both.")
     audio = st.audio_input("Record your message")
     
-    speaking_as = CURRENT_USER
 
     if audio is not None:
         with open("temp_input.wav", "wb") as f:
@@ -312,3 +313,45 @@ elif page == "Dashboard":
         for name, v in MOCK_MEMBERS.items()
     ]).sort_values("Position")
     st.dataframe(rotation_df, use_container_width=True, hide_index=True)
+
+
+# ============================================================
+# PAGE 3: Benchmark
+# ============================================================
+elif page == "Benchmark":
+    render_header("Benchmark")
+    st.caption("Comparison across 3 speech models on real code-switched test audio, recorded and evaluated during development.")
+
+    BENCHMARK_DATA = [
+        {
+            "Test Case": "testcase1",
+            "Ground Truth": "Nimeweka 2000 leo. That's my deposit ya loan repayment, na next Friday ni zamu ya Grace.",
+            "Sahara": "Nimeweka 2,000 leo. That's my deposit Yelon repayment na next Friday ni za Grace.",
+            "Whisper": "Nimeweka 2000 lewa. That's my deposit, a loan repayment na next Friday nizamu ya grace.",
+            "MMS": "nimeweka 200leo dhat's may dipositi ya lon repayment na next fridey ni zamu ya greece"
+        },
+        {
+            "Test Case": "testcase2",
+            "Ground Truth": "Nimechelewa this month, but nitatuma the full amount next Friday, hiyo iko sawa?",
+            "Sahara": "Nimechelewa mwezi huu lakini nitatuma kiasi chote Ijumaa ijayo. Hiyo iko sawa.",
+            "Whisper": "Imechelewa this month, but nita tumade full amount next Friday. Yoi kusawa.",
+            "MMS": "nimechelewa this month bat nitatuma the fuu la mount next fridey yoo iko sawa"
+        },
+        {
+            "Test Case": "testcase3",
+            "Ground Truth": "Leo tulipata three new members kwenye group, so tuta-adjust rotation kidogo, utapokea payout yako mwezi ujao instead of this month.",
+            "Sahara": "Leo tulipata members 3 wapya kwenye group, so tutafanya rotation kidogo, utapokea payout yako mwezi ujao instead of this month.",
+            "Whisper": "Leotuli patatrinu membas kweni grub, sututad adjust rotation kidogo, utapokia peia utiako muizi ujao instead of this month.",
+            "MMS": "leo tulipata 3 new members kwenye group su tutaadjust tratition kidogo utapokea peauti yako mwezi ujao instead of this month"
+        }
+    ]
+
+    st.dataframe(pd.DataFrame(BENCHMARK_DATA), use_container_width=True, hide_index=True)
+
+    st.subheader("Key findings")
+    st.markdown("""
+    - **Sahara** preserves code-switched sentence structure and grammar most reliably, but shows run-to-run instability on financial-domain terms specifically (e.g. "loan repayment" → "Yelon repayment" in one run, correct in another).
+    - **Whisper** correctly transcribed the one financial term Sahara mangled ("loan repayment," testcase1), but broke down more severely on basic word boundaries and grammar in longer, faster code-switched speech.
+    - **MMS** (locked to Swahili via `target_lang="swh"`) produced phonetic, uncapitalized transcriptions that treat English words as if sounding them out in Swahili spelling — a distinct third failure mode, consistent with running a monolingual model on code-switched input.
+    - No model was reliably accurate across all three test cases; each had a different, characteristic failure pattern rather than a simple "better/worse" ranking.
+    """)

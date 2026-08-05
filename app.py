@@ -67,6 +67,8 @@ CURRENT_MONTH_INDEX = REAL_TODAY.month
 
 BENCHMARK_SAMPLE_START_INDEX = 4  # continues from testcase1-3 already used in the notebook
 
+PENALTY_RATE_PER_MONTH_LATE = 0.05  # assumption: 5% of that month's installment, per month overdue — not specified in requirements
+
 
 def get_member_by_position(position):
     for name, data in MOCK_MEMBERS.items():
@@ -86,7 +88,7 @@ def compute_date_for_offset(offset_months):
 def build_initial_schedule():
     positions_sorted = sorted(MOCK_MEMBERS.items(), key=lambda x: x[1]["payout_position"])
     schedule = {data["payout_position"]: compute_date_for_offset(i) for i, (name, data) in enumerate(positions_sorted)}
-    schedule[1] = date.today()
+    schedule[1] = date.today()  # override: position 1's payout is due today, for demo purposes
     return schedule
 
 
@@ -106,7 +108,7 @@ if "simulated_today" not in st.session_state:
 if "scheduled_reminders" not in st.session_state:
     st.session_state.scheduled_reminders = []
 if "benchmark_samples" not in st.session_state:
-    st.session_state.benchmark_samples = []  # list of {index, audio_bytes, ground_truth}
+    st.session_state.benchmark_samples = []
 
 
 def get_pending_loan_for_member(member_name):
@@ -175,7 +177,8 @@ def extract_chama_action(transcript, speaker_name):
         return json.dumps({
             "reasoning": "Transcript empty or too short to contain meaningful speech.",
             "speaker_action": "other", "amount": None,
-            "referenced_member": "none", "referenced_member_context": "none", "action_type": "other"
+            "referenced_member": "none", "referenced_member_context": "none", "action_type": "other",
+            "loan_duration_months": None
         })
     prompt = f"""You are extracting structured data from a chama (savings group) voice message.
 The message may mix English and Swahili.
@@ -196,26 +199,31 @@ CRITICAL RULES:
 - If the speaker is COMMANDING a regular scheduled payout be sent to a member (e.g. "Tuma X kwa Y"), this is "initiate_scheduled_payout".
 - If the speaker is asking to BORROW money for themselves, this is "loan_request".
 - If the speaker (an admin) is APPROVING or releasing an already-requested loan payout for another member (e.g. "Approve mkopo wa Juma", "Send Juma's loan"), this is "initiate_loan_payout", and referenced_member is that OTHER member, not {speaker_name}.
+- If the speaker (admin) specifies a loan duration in months (e.g. "kwa miezi sita" / "for six months"), extract it as loan_duration_months. If not mentioned, loan_duration_months is null.
 
 Example 1:
 Transcript: "Nimechelewa mwezi huu lakini nitatuma kiasi chote Ijumaa ijayo."
-Correct extraction: {{"reasoning": "Speaker is reporting their own status. Future tense 'nitatuma' means not yet paid. No amount stated in digits or words.", "speaker_action": "late_payment_note", "amount": null, "referenced_member": "none", "referenced_member_context": "none", "action_type": "late_payment_note"}}
+Correct extraction: {{"reasoning": "Speaker is reporting their own status. Future tense 'nitatuma' means not yet paid. No amount stated in digits or words.", "speaker_action": "late_payment_note", "amount": null, "referenced_member": "none", "referenced_member_context": "none", "action_type": "late_payment_note", "loan_duration_months": null}}
 
 Example 2:
 Transcript: "Nimetuma pesa kidogo leo."
-Correct extraction: {{"reasoning": "Speaker completed an action ('nimetuma'). 'Kidogo' is a vague qualifier, not a digit or number word, so no real amount was stated.", "speaker_action": "deposit", "amount": null, "referenced_member": "none", "referenced_member_context": "none", "action_type": "deposit"}}
+Correct extraction: {{"reasoning": "Speaker completed an action ('nimetuma'). 'Kidogo' is a vague qualifier, not a digit or number word, so no real amount was stated.", "speaker_action": "deposit", "amount": null, "referenced_member": "none", "referenced_member_context": "none", "action_type": "deposit", "loan_duration_months": null}}
 
 Example 3:
 Transcript: "Tuma elfu mbili kwa Grace leo."
-Correct extraction: {{"reasoning": "Speaker is issuing a command to send a scheduled payout to another member, Grace — not the speaker.", "speaker_action": "initiate_scheduled_payout", "amount": 2000, "referenced_member": "Grace", "referenced_member_context": "payout recipient", "action_type": "payout"}}
+Correct extraction: {{"reasoning": "Speaker is issuing a command to send a scheduled payout to another member, Grace — not the speaker.", "speaker_action": "initiate_scheduled_payout", "amount": 2000, "referenced_member": "Grace", "referenced_member_context": "payout recipient", "action_type": "payout", "loan_duration_months": null}}
 
 Example 4:
 Transcript: "Naomba mkopo wa elfu tano."
-Correct extraction: {{"reasoning": "Speaker is requesting to borrow money for themselves from the group. No other member named.", "speaker_action": "loan_request", "amount": 5000, "referenced_member": "none", "referenced_member_context": "none", "action_type": "other"}}
+Correct extraction: {{"reasoning": "Speaker is requesting to borrow money for themselves from the group. No other member named.", "speaker_action": "loan_request", "amount": 5000, "referenced_member": "none", "referenced_member_context": "none", "action_type": "other", "loan_duration_months": null}}
 
 Example 5:
 Transcript: "Approve mkopo wa Juma."
-Correct extraction: {{"reasoning": "Speaker is approving and releasing an existing loan payout for another member, Juma — the speaker is the admin taking the action, Juma is who it's about, not the speaker.", "speaker_action": "initiate_loan_payout", "amount": null, "referenced_member": "Juma", "referenced_member_context": "loan payout approval", "action_type": "payout"}}
+Correct extraction: {{"reasoning": "Speaker is approving and releasing an existing loan payout for another member, Juma — the speaker is the admin taking the action, Juma is who it's about, not the speaker. No duration mentioned.", "speaker_action": "initiate_loan_payout", "amount": null, "referenced_member": "Juma", "referenced_member_context": "loan payout approval", "action_type": "payout", "loan_duration_months": null}}
+
+Example 6:
+Transcript: "Approve mkopo wa Juma kwa miezi sita."
+Correct extraction: {{"reasoning": "Admin is approving Juma's loan and specifying a 6-month repayment duration.", "speaker_action": "initiate_loan_payout", "amount": null, "referenced_member": "Juma", "referenced_member_context": "loan payout approval", "action_type": "payout", "loan_duration_months": 6}}
 
 Now extract from this transcript, spoken by {speaker_name}:
 Transcript: "{transcript}"
@@ -223,10 +231,10 @@ Transcript: "{transcript}"
 First, in "reasoning", briefly state: (a) who is speaking (should be {speaker_name}), (b) what tense/timing they use,
 (c) whether they personally took a financial action or are acting on behalf of / referencing someone else,
 (d) whether an amount was stated as digits, as words, or not stated at all.
-Then extract the five fields, matching your reasoning.
+Then extract the six fields, matching your reasoning.
 
 Respond with ONLY valid JSON in this exact structure, no other text:
-{{"reasoning": "...", "speaker_action": "...", "amount": ..., "referenced_member": "...", "referenced_member_context": "...", "action_type": "..."}}"""
+{{"reasoning": "...", "speaker_action": "...", "amount": ..., "referenced_member": "...", "referenced_member_context": "...", "action_type": "...", "loan_duration_months": ...}}"""
     response = groq_client.chat.completions.create(
         model="llama-3.1-8b-instant",
         messages=[{"role": "user", "content": prompt}],
@@ -252,6 +260,8 @@ def validate_extraction(transcript, extracted):
     if extracted.get("speaker_action") not in VALID_SPEAKER_ACTIONS:
         extracted["_flag_invalid_speaker_action"] = extracted.get("speaker_action")
         extracted["speaker_action"] = "other"
+    if "loan_duration_months" not in extracted:
+        extracted["loan_duration_months"] = None
     extracted.pop("reasoning", None)
     return extracted
 
@@ -291,6 +301,52 @@ def check_loan_eligibility(member_name, amount):
     if amount > member["loan_eligible"]:
         return False, f"{member_name} requested {amount}, which exceeds their eligible limit of {member['loan_eligible']}."
     return True, f"{member_name} is eligible for a loan of {amount}. [SIMULATED] Would send funds to their registered phone number."
+
+
+def calculate_loan_terms(principal, duration_months, interest_rate=0.08, processing_fee_rate=0.03, approval_date=None):
+    """Flat (non-compounding) interest, calculated once on principal. Simplification, disclosed as such."""
+    if approval_date is None:
+        approval_date = st.session_state.simulated_today
+    interest_amount = round(principal * interest_rate, 2)
+    processing_fee = round(principal * processing_fee_rate, 2)
+    total_repayable = round(principal + interest_amount + processing_fee, 2)
+    monthly_payment = round(total_repayable / duration_months, 2)
+
+    schedule = []
+    for i in range(1, duration_months + 1):
+        due_date = approval_date + timedelta(days=30 * i)
+        schedule.append({
+            "month": i,
+            "due_date": due_date.strftime("%d/%m/%Y"),
+            "amount_due": monthly_payment,
+            "status": "pending",
+            "penalty_accrued": 0.0
+        })
+
+    return {
+        "interest_rate": interest_rate,
+        "interest_amount": interest_amount,
+        "processing_fee_rate": processing_fee_rate,
+        "processing_fee": processing_fee,
+        "duration_months": duration_months,
+        "total_repayable": total_repayable,
+        "monthly_payment": monthly_payment,
+        "approval_date": approval_date.strftime("%d/%m/%Y"),
+        "schedule": schedule,
+    }
+
+
+def update_schedule_penalties(loan_request):
+    """Marks overdue installments and computes accrued penalty. Does not yet handle marking installments as paid."""
+    if "schedule" not in loan_request:
+        return loan_request
+    today = st.session_state.simulated_today
+    for entry in loan_request["schedule"]:
+        due = pd.to_datetime(entry["due_date"], format="%d/%m/%Y").date()
+        if entry["status"] == "pending" and today > due:
+            entry["status"] = "overdue"
+            entry["penalty_accrued"] = round(entry["amount_due"] * PENALTY_RATE_PER_MONTH_LATE, 2)
+    return loan_request
 
 
 def generate_tts(text, voice_accent="swahili", voice_gender="female", voice_language="en"):
@@ -480,16 +536,22 @@ if page == "Record & Query":
                     if edited_speaker_action == "initiate_loan_payout" and IS_ADMIN and edited_referenced_member not in ("none", ""):
                         ai_action_taken = True
                         pending_loan = get_pending_loan_for_member(edited_referenced_member)
+                        spoken_duration = extracted.get("loan_duration_months")
                         if not pending_loan:
                             st.error(f"❌ No pending loan request found for {edited_referenced_member}.")
                             confirmation_text += f" No pending loan request found for {edited_referenced_member}."
+                        elif not spoken_duration:
+                            st.error("❌ Please state the loan duration in months (e.g. 'kwa miezi sita') before approving.")
+                            confirmation_text += " Please state the loan duration in months before approving."
                         else:
                             eligible, elig_message = check_loan_eligibility(edited_referenced_member, pending_loan["amount"])
                             idx = st.session_state.loan_requests.index(pending_loan)
                             if eligible:
+                                terms = calculate_loan_terms(pending_loan["amount"], spoken_duration)
                                 st.session_state.loan_requests[idx]["status"] = "approved"
+                                st.session_state.loan_requests[idx].update(terms)
                                 st.success(f"✅ SIMULATED LOAN PAYMENT — {elig_message}")
-                                confirmation_text += f" Loan payout of {pending_loan['amount']} approved and simulated as sent to {edited_referenced_member}."
+                                confirmation_text += f" Loan payout of {pending_loan['amount']} approved over {spoken_duration} months. Monthly payment: {terms['monthly_payment']}."
                             else:
                                 st.error(f"❌ Loan payout blocked — {elig_message}")
                                 confirmation_text += f" Loan payout blocked. {elig_message}"
@@ -631,27 +693,32 @@ elif page == "Dashboard":
                 for idx, lr in enumerate(st.session_state.loan_requests):
                     if lr["status"] != "pending":
                         continue
-                    col1, col2, col3 = st.columns([3, 2, 2])
-                    col1.write(f"**{lr['member']}** requests **{lr['amount']}**")
-                    if col2.button("Approve", key=f"approve_{idx}"):
-                        eligible, elig_message = check_loan_eligibility(lr["member"], lr["amount"])
-                        if eligible:
-                            st.session_state.loan_requests[idx]["status"] = "approved"
-                            st.session_state.ledger.append({
-                                "speaker": CURRENT_USER,
-                                "speaker_action": "initiate_loan_payout",
-                                "amount": lr["amount"],
-                                "referenced_member": lr["member"],
-                                "referenced_member_context": "loan approval",
-                                "action_type": "payout",
-                                "amended_by_human": False,
-                                "ai_action_taken": True
-                            })
-                            st.success(f"✅ SIMULATED LOAN PAYMENT — {elig_message}")
-                            st.rerun()
-                        else:
-                            st.error(f"❌ {elig_message}")
-                    if col3.button("Reject", key=f"reject_{idx}"):
+                    st.write(f"**{lr['member']}** requests **{lr['amount']}**")
+                    with st.expander(f"Set terms and approve — {lr['member']}"):
+                        fee_pct = st.number_input("Processing fee (%)", value=3.0, min_value=0.0, max_value=100.0, step=0.5, key=f"fee_{idx}")
+                        interest_pct = st.number_input("Interest (%)", value=8.0, min_value=0.0, max_value=100.0, step=0.5, key=f"interest_{idx}")
+                        duration = st.number_input("Duration (months)", min_value=1, max_value=36, value=6, key=f"duration_{idx}")
+                        if st.button("Confirm approval", key=f"confirm_approve_{idx}"):
+                            eligible, elig_message = check_loan_eligibility(lr["member"], lr["amount"])
+                            if eligible:
+                                terms = calculate_loan_terms(lr["amount"], duration, interest_rate=interest_pct/100, processing_fee_rate=fee_pct/100)
+                                st.session_state.loan_requests[idx]["status"] = "approved"
+                                st.session_state.loan_requests[idx].update(terms)
+                                st.session_state.ledger.append({
+                                    "speaker": CURRENT_USER,
+                                    "speaker_action": "initiate_loan_payout",
+                                    "amount": lr["amount"],
+                                    "referenced_member": lr["member"],
+                                    "referenced_member_context": "loan approval",
+                                    "action_type": "payout",
+                                    "amended_by_human": False,
+                                    "ai_action_taken": True
+                                })
+                                st.success(f"✅ SIMULATED LOAN PAYMENT — {elig_message} Monthly payment: {terms['monthly_payment']} over {duration} months.")
+                                st.rerun()
+                            else:
+                                st.error(f"❌ {elig_message}")
+                    if st.button("Reject", key=f"reject_{idx}"):
                         st.session_state.loan_requests[idx]["status"] = "rejected"
                         st.rerun()
 
@@ -660,7 +727,17 @@ elif page == "Dashboard":
             if not approved:
                 st.info("No approved loan requests yet.")
             else:
-                st.dataframe(pd.DataFrame(approved), use_container_width=True, hide_index=True)
+                for lr in approved:
+                    lr = update_schedule_penalties(lr)
+                    st.markdown(
+                        f"**{lr['member']}** — Principal: {lr['amount']} | "
+                        f"Interest: {lr['interest_rate']*100:.0f}% ({lr['interest_amount']}) | "
+                        f"Fee: {lr['processing_fee_rate']*100:.0f}% ({lr['processing_fee']}) | "
+                        f"Total repayable: {lr['total_repayable']} | Monthly: {lr['monthly_payment']}"
+                    )
+                    with st.expander(f"Payment schedule — {lr['member']}"):
+                        st.dataframe(pd.DataFrame(lr["schedule"]), use_container_width=True, hide_index=True)
+                    st.divider()
 
         with tab_rejected:
             rejected = [lr for lr in st.session_state.loan_requests if lr["status"] == "rejected"]
@@ -707,7 +784,16 @@ elif page == "Dashboard":
         if not my_loans:
             st.info("No loan requests yet.")
         else:
-            st.dataframe(pd.DataFrame(my_loans), use_container_width=True, hide_index=True)
+            for lr in my_loans:
+                st.write(f"**Amount:** {lr['amount']} — **Status:** {lr['status']}")
+                if lr["status"] == "approved":
+                    lr = update_schedule_penalties(lr)
+                    st.write(
+                        f"Interest: {lr['interest_rate']*100:.0f}% | Fee: {lr['processing_fee_rate']*100:.0f}% | "
+                        f"Duration: {lr['duration_months']} months | Monthly: {lr['monthly_payment']} | Total: {lr['total_repayable']}"
+                    )
+                    st.dataframe(pd.DataFrame(lr["schedule"]), use_container_width=True, hide_index=True)
+                st.divider()
 
 # ============================================================
 # PAGE 3: Benchmark Data

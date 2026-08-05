@@ -177,8 +177,42 @@ if audio is not None:
     with st.spinner("Extracting details..."):
         extracted_raw = extract_chama_action(transcript)
         extracted = json.loads(extracted_raw) if isinstance(extracted_raw, str) else extracted_raw
-        st.json(extracted)  # shows raw extraction including reasoning, before validation strips it
+        st.json(extracted)
         extracted = validate_extraction(transcript, extracted)
+
+    st.subheader("Review before submitting")
+    edited_speaker_action = st.selectbox(
+        "Action", list(VALID_SPEAKER_ACTIONS),
+        index=list(VALID_SPEAKER_ACTIONS).index(extracted["speaker_action"])
+    )
+    edited_amount = st.number_input(
+        "Amount", value=float(extracted["amount"]) if extracted["amount"] is not None else 0.0,
+        min_value=0.0, step=1.0
+    )
+    edited_referenced_member = st.text_input("Referenced member", value=extracted["referenced_member"])
+
+    if st.button("Confirm and submit"):
+        was_amended = (
+            edited_speaker_action != extracted["speaker_action"]
+            or (extracted["amount"] is not None and edited_amount != extracted["amount"])
+            or (extracted["amount"] is None and edited_amount != 0.0)
+            or edited_referenced_member != extracted["referenced_member"]
+        )
+
+        final_entry = dict(extracted)
+        final_entry["speaker_action"] = edited_speaker_action
+        final_entry["amount"] = edited_amount if edited_amount > 0 else None
+        final_entry["referenced_member"] = edited_referenced_member
+        final_entry["amended_by_human"] = was_amended
+        final_entry["ai_original_amount"] = extracted["amount"]
+        final_entry["ai_original_speaker_action"] = extracted["speaker_action"]
+
+        st.session_state.ledger.append(final_entry)
+        confirmation_text = generate_confirmation_text(final_entry)
+        with st.spinner("Generating spoken confirmation..."):
+            audio_url = generate_tts(confirmation_text)
+        st.write("**Confirmation:**", confirmation_text)
+        st.audio(audio_url)
         
     if needs_confirmation(extracted):
         st.session_state.pending_confirmation = extracted

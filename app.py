@@ -87,6 +87,8 @@ NUMBER_WORDS = [
     "mia", "elfu", "milioni"
 ]
 
+SCALE_WORDS = ["elfu", "mia", "thousand", "hundred", "milioni", "million"]
+
 def validate_extraction(transcript, extracted):
     if extracted.get("amount") is not None:
         transcript_lower = transcript.lower()
@@ -99,6 +101,20 @@ def validate_extraction(transcript, extracted):
             extracted["_original_amount_before_validation"] = extracted["amount"]
             extracted["amount"] = None
             extracted["_flag"] = "amount removed: no digit or number word found in transcript"
+
+        # New: flag suspiciously small amounts with no scale word present
+        elif extracted["amount"] is not None and extracted["amount"] < 100:
+            has_scale_word = any(
+                re.search(rf'\b{re.escape(word)}\b', transcript_lower)
+                for word in SCALE_WORDS
+            )
+            if not has_scale_word:
+                extracted["_flag"] = f"amount {extracted['amount']} may be missing a scale word (elfu/mia/thousand) — possible transcription drop"
+
+    if extracted.get("speaker_action") not in VALID_SPEAKER_ACTIONS:
+        extracted["_flag_invalid_speaker_action"] = extracted.get("speaker_action")
+        extracted["speaker_action"] = "other"
+
     extracted.pop("reasoning", None)
     return extracted
 

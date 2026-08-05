@@ -103,6 +103,9 @@ def validate_extraction(transcript, extracted):
     return extracted
 
 
+def needs_confirmation(extracted):
+    return "_flag" in extracted or "_flag_invalid_speaker_action" in extracted
+
 def generate_tts(text, voice_accent="swahili", voice_gender="female", voice_language="en"):
     url = "https://infer.voice.intron.io/tts/v1/generate"
     headers = {"Authorization": f"Bearer {SAHARA_API_KEY}", "Content-Type": "application/json"}
@@ -144,14 +147,22 @@ if audio is not None:
     with st.spinner("Extracting details..."):
         extracted = extract_chama_action(transcript)
     st.json(extracted)
+    
+    if needs_confirmation(extracted):
+        st.warning("This message was unclear. Confirmation step needed.")
+        confirmation_question = generate_confirmation_question(extracted)  # not yet written
+        with st.spinner("Generating question..."):
+            question_audio_url = generate_tts(confirmation_question)
+        st.audio(question_audio_url)
+        # second st.audio_input and re-processing logic goes here — not yet written
+    else:
+        st.session_state.ledger.append(extracted)
+        confirmation_text = generate_confirmation_text(extracted)
+        with st.spinner("Generating spoken confirmation..."):
+            audio_url = generate_tts(confirmation_text)
+        st.write("**Confirmation:**", confirmation_text)
+        st.audio(audio_url)
 
-    st.session_state.ledger.append(extracted)
-
-    confirmation_text = generate_confirmation_text(extracted)
-    with st.spinner("Generating spoken confirmation..."):
-        audio_url = generate_tts(confirmation_text)
-    st.write("**Confirmation:**", confirmation_text)
-    st.audio(audio_url)
 
 st.divider()
 st.subheader("Ledger")

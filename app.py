@@ -701,7 +701,7 @@ def generate_confirmation_text(entry):
 # Page config + visual polish
 # ============================================================
 
-st.set_page_config(page_title="Habahub", page_icon="🎙️", layout="wide")
+st.set_page_config(page_title="HabaHub", page_icon="🎙️", layout="wide")
 
 st.markdown("""
 <style>
@@ -805,7 +805,7 @@ if "loan_summary_text" not in st.session_state:
 if "loan_summary_duration" not in st.session_state:
     st.session_state.loan_summary_duration = None
 
-st.sidebar.title("🎙️ Habahub")
+st.sidebar.title("🎙️ HabaHub")
 st.sidebar.markdown(f"**{CURRENT_USER}** ({'Admin' if IS_ADMIN else 'Member'})")
 st.sidebar.divider()
 page = st.sidebar.radio("Navigate", ["Overview", "Dashboard", "Record & Query", "Benchmark Data"])
@@ -835,14 +835,14 @@ if page == "Overview":
     st.markdown(
         """
         <div style="text-align:center; padding: 30px 10px 10px 10px;">
-            <h1 style="color:#1F7A5C; margin-bottom:0;">🎙️ Habahub</h1>
+            <h1 style="color:#1F7A5C; margin-bottom:0;">🎙️ HabaHub</h1>
             <p style="font-size:1.2rem; color:#22332C; margin-top:4px;">Run your chama by voice, in the language you actually speak.</p>
         </div>
         """,
         unsafe_allow_html=True
     )
 
-    st.markdown("### Why Use Habahub?")
+    st.markdown("### Why Use HabaHub?")
     b1, b2, b3 = st.columns(3)
     with b1:
         st.markdown("##### 🗣️ Speak Naturally")

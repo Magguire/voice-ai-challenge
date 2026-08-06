@@ -187,11 +187,13 @@ def clean_agent_text(text):
 def text_for_tts(text):
     """Sahara's TTS reads a sentence-ending period aloud as the word for the punctuation mark rather than
     treating it as a silent pause. clean_agent_text() keeps those periods for on-screen/chat readability,
-    so this strips them too, specifically for whatever is actually sent to generate_tts(). Decimal points
-    inside numbers are preserved, since those need to stay for the amount to be spoken correctly."""
+    so this strips them too, specifically for whatever is actually sent to generate_tts(). A period only
+    survives if it has a digit on BOTH sides (a real decimal like 2160.50); a period following a digit but
+    ending a sentence (e.g. "...loan of 5000.") is still stripped, since only one side being a digit isn't
+    a genuine decimal."""
     if not text:
         return text
-    return re.sub(r'(?<!\d)[.](?!\d)', '', text)
+    return re.sub(r'(?<!\d)\.|\.(?!\d)', '', text)
 
 
 def is_transcript_understandable(transcript):

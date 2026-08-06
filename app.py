@@ -7,6 +7,7 @@ import pandas as pd
 import calendar
 import zipfile
 import io
+import time
 from datetime import date, timedelta
 
 SAHARA_API_KEY = st.secrets["SAHARA_API_KEY"]
@@ -135,6 +136,8 @@ if "benchmark_samples" not in st.session_state:
     st.session_state.benchmark_samples = []
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = {}
+if "suspicious_activity_log" not in st.session_state:
+    st.session_state.suspicious_activity_log = []
 
 
 def get_pending_loan_for_member(member_name):
@@ -147,6 +150,38 @@ def get_pending_loan_for_member(member_name):
 def log_chat(member_name, role, text):
     """role is 'user' or 'bongo'. Chat history is per-member, not shared across users."""
     st.session_state.chat_history.setdefault(member_name, []).append({"role": role, "text": text})
+
+
+def detect_impersonation(transcript, speaking_as):
+    """Checks whether a non-admin claims to actually BE a different named person (e.g. the admin) to gain
+    elevated authority. Runs only for non-admin statements to limit added latency."""
+    prompt = f"""The person currently logged into this chama app as "{speaking_as}" just said the following.
+Determine if they are claiming, in this message, to actually BE a different named person (e.g. "My name is
+Wendo", "Mimi ni Wendo", "This is Wendo speaking", "I am the admin") in order to get something done that
+their real logged-in identity, {speaking_as}, might not be authorized to do.
+
+Transcript: "{transcript}"
+
+Respond with ONLY valid JSON: {{"impersonation_detected": true or false, "claimed_identity": "name or none", "reason": "brief reason"}}"""
+    response = groq_client.chat.completions.create(
+        model="llama-3.1-8b-instant",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0,
+        response_format={"type": "json_object"}
+    )
+    return json.loads(response.choices[0].message.content)
+
+
+def clean_agent_text(text):
+    """Strips punctuation from Bongo's spoken/displayed replies, per instruction, while preserving
+    decimal points inside numbers (e.g. 2160.50 stays intact) and collapsing extra whitespace left behind."""
+    if not text:
+        return text
+    text = text.replace("—", " ")
+    text = re.sub(r'(?<!\d)[.](?!\d)', '', text)
+    text = re.sub(r'[,;:!?"\'()]', '', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
 
 
 # ============================================================
@@ -188,7 +223,7 @@ contribution", "Approve Juma's loan"). This includes future-tense payment commit
 Ijumaa" since those log a real commitment.
 
 "question" means the speaker is seeking information, asking HOW something works, asking IF something is
-possible, or asking for clarification — even if the topic is loans, payouts, or payments — as long as they
+possible, or asking for clarification, even if the topic is loans, payouts, or payments, as long as they
 are NOT giving a specific amount/action to execute right now. Examples: "How do I apply for a loan?",
 "Ninawezaje kuomba mkopo?", "Can members borrow money?", "What happens if I pay late?", "When is my turn?".
 These are questions, not requests, even though they mention loans or payments.
@@ -226,159 +261,6 @@ Respond with ONLY one word: own_account, payout_rotation, admin_aggregate, defin
     return response.choices[0].message.content.strip().lower()
 
 
-def get_member_loan_context(member_name):
-    """Real, computed loan figures for this member — used so Bongo's follow-up answers (penalty in KES,
-    first payment date, etc.) come from actual numbers, never estimates from memory."""
-    context = {"pending_loan": None, "approved_loans": []}
-
-    pending = get_pending_loan_for_member(member_name)
-    if pending:
-        dur = pending.get("suggested_duration_months", 4)
-        est = calculate_loan_estimate(pending["amount"], dur)
-        penalty_kes = round(pending["amount"] * PENALTY_RATE_PER_MONTH_LATE, 2)
-        context["pending_loan"] = {
-            "amount": pending["amount"],
-            "duration_months": dur,
-            "estimated_monthly_payment": est["monthly"],
-            "estimated_total_repayable": est["total"],
-            "penalty_per_late_payment_kes": penalty_kes,
-            "first_payment_note": "First payment will be due 30 days after admin approval — not yet approved, so no exact date yet."
-        }
-
-    for lr in st.session_state.loan_requests:
-        if lr["member"] == member_name and lr["status"] == "approved":
-            lr = update_schedule_penalties(lr)
-            first_due = lr["schedule"][0]["due_date"] if lr.get("schedule") else None
-            context["approved_loans"].append({
-                "principal": lr["amount"],
-                "monthly_payment": lr["monthly_payment"],
-                "total_repayable": lr["total_repayable"],
-                "penalty_per_late_payment_kes": round(lr["monthly_payment"] * PENALTY_RATE_PER_MONTH_LATE, 2),
-                "first_payment_due_date": first_due,
-                "installment_schedule": lr["schedule"],
-            })
-
-    return context
-
-
-def answer_member_query(transcript, member_name, is_admin):
-    member_record = dict(MOCK_MEMBERS.get(member_name, {}))
-    member_record["loans"] = get_member_loan_context(member_name)
-    fallback_contact = "customer service" if is_admin else "the chama admin"
-
-    prompt = f"""You are {BONGO_NAME}, a friendly chama (savings group) voice assistant, speaking DIRECTLY
-to the person whose data this is. The message may be in English, Swahili, or a mix.
-
-ALWAYS address the speaker as "you" / "your" — this data belongs to them personally. Never refer to them
-by name in the third person (e.g. never say "Juma's balance is..." — say "your balance is...").
-
-There are four kinds of questions you might be asked:
-1. Questions about THEIR OWN account or loans (balance, when they last paid, loan terms, penalty amounts,
-   first payment date). Answer using ONLY the data provided below, including the "loans" section. Penalties
-   are always 2% of the relevant amount (the loan principal if not yet approved, or that month's installment
-   if approved) — use the exact penalty_per_late_payment_kes figures already computed in the data, do not
-   recalculate or guess.
-2. Questions asking what a TERM or CONCEPT means. Answer in plain, simple language.
-3. Questions asking HOW something works or HOW to do something (e.g. "how do I request a loan", "how can I
-   schedule a payment reminder", "ninawezaje kuomba mkopo") — this is a CLARIFICATION, not a request. Explain
-   the process in plain language (mention relevant numbers like their own eligibility, or the interest/fee/
-   penalty rates, if helpful), then end by offering to help them actually do it, e.g. "Would you like me to
-   start that for you now — just tell me the amount." Do NOT treat this as if the action has already happened.
-4. Anything you cannot answer from the data below or a general explanation — do NOT guess or invent an
-   answer. Instead, respond exactly along these lines: "I don't have that information — please contact
-   {fallback_contact} for help with that."
-
-Member data for {member_name} (illustrative demo data): {json.dumps(member_record)}
-
-Question: "{transcript}"
-
-Give a short, direct, spoken-style answer (1-3 sentences, up to 4 for process explanations)."""
-    response = groq_client.chat.completions.create(
-        model="llama-3.1-8b-instant",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0
-    )
-    return response.choices[0].message.content
-
-
-def answer_payout_rotation_query(member_name, is_admin):
-    """Members get only position numbers (no names). Admins get the recipient's name and their own date too."""
-    positions_sorted = sorted(MOCK_MEMBERS.items(), key=lambda x: x[1]["payout_position"])
-    next_position, next_name = None, None
-    for name, data in positions_sorted:
-        pos = data["payout_position"]
-        if pos not in st.session_state.payouts_made_positions:
-            next_position, next_name = pos, name
-            break
-
-    my_position = MOCK_MEMBERS.get(member_name, {}).get("payout_position")
-
-    if is_admin:
-        next_date = st.session_state.payout_schedule.get(next_position)
-        my_date = st.session_state.payout_schedule.get(my_position)
-        return (
-            f"Position {next_position} is next — that's {next_name}, scheduled for "
-            f"{next_date.strftime('%d/%m/%Y') if next_date else 'an unset date'}. "
-            f"Your own payout (position {my_position}) is scheduled for "
-            f"{my_date.strftime('%d/%m/%Y') if my_date else 'an unset date'}."
-        )
-    else:
-        return f"Position {next_position} is next in line to receive the payout. You are position {my_position}."
-
-
-def answer_admin_aggregate_query(transcript):
-    """Answers bookkeeping-style questions from real session data, filtered as requested. Admin-only — never called for members."""
-    approved = [lr for lr in st.session_state.loan_requests if lr["status"] == "approved"]
-    this_month_start = date(st.session_state.simulated_today.year, st.session_state.simulated_today.month, 1)
-
-    this_month_loans = []
-    for lr in approved:
-        approval_date_str = lr.get("approval_date")
-        if not approval_date_str:
-            continue
-        try:
-            approval_dt = pd.to_datetime(approval_date_str, format="%d/%m/%Y").date()
-        except (ValueError, TypeError):
-            continue
-        if approval_dt >= this_month_start:
-            this_month_loans.append(lr)
-
-    total_this_month = sum(lr["amount"] for lr in this_month_loans)
-
-    summary_data = {
-        "loans_approved_this_month_count": len(this_month_loans),
-        "loans_approved_this_month_total": total_this_month,
-        "total_pending_loan_requests": len([lr for lr in st.session_state.loan_requests if lr["status"] == "pending"]),
-        "total_rejected_loan_requests": len([lr for lr in st.session_state.loan_requests if lr["status"] == "rejected"]),
-        "members_not_paid_this_month": [n for n, d in MOCK_MEMBERS.items() if not d["this_month_paid"]],
-        "total_owed_group_wide": sum(d["owed"] for d in MOCK_MEMBERS.values()),
-    }
-
-    prompt = f"""You are {BONGO_NAME}, a chama admin assistant with full bookkeeping access.
-Answer using ONLY this data — do not invent numbers. If the question cannot be answered from this data,
-say: "I don't have that information — please contact customer service for help with that."
-
-Data: {json.dumps(summary_data)}
-
-Question: "{transcript}"
-
-Give a short, direct spoken-style answer (1-2 sentences)."""
-    response = groq_client.chat.completions.create(
-        model="llama-3.1-8b-instant",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0
-    )
-
-    table = [{"Member": lr["member"], "Amount": lr["amount"], "Approved": lr.get("approval_date", "N/A")} for lr in this_month_loans]
-    return response.choices[0].message.content, table
-
-
-def answer_restricted_query(member_name):
-    """Fallback for members asking admin-only aggregate questions — states the restriction, then offers what they CAN know."""
-    my_eligible = MOCK_MEMBERS.get(member_name, {}).get("loan_eligible", 0)
-    return f"That information isn't available to members — it's for group administrators only. What I can tell you: you're eligible for a loan of up to {my_eligible}."
-
-
 def extract_chama_action(transcript, speaker_name):
     if not transcript or len(transcript.strip()) < 5:
         return json.dumps({
@@ -392,15 +274,15 @@ The message may mix English and Swahili.
 
 IMPORTANT: The person speaking this message is logged in as "{speaker_name}". This is a known fact,
 not something to guess. If the speaker mentions another person's name (e.g. "Juma", "Grace"), that
-name refers to a DIFFERENT person than {speaker_name}, never to the speaker themselves — even if the
+name refers to a DIFFERENT person than {speaker_name}, never to the speaker themselves, even if the
 sentence is a command or approval naming that other person. Only treat an action as about {speaker_name}
 if the speaker uses first-person language ("mimi", "yangu", "I", "my") or names no one else.
 
 CRITICAL RULES:
 - Only extract information explicitly stated. Do NOT infer or guess missing values.
-- If no amount is mentioned, amount must be null — never 0, never invented, never a small placeholder number.
+- If no amount is mentioned, amount must be null, never 0, never invented, never a small placeholder number.
 - Amounts may be stated as digits (e.g. "2000") or as words (e.g. "elfu mbili" / "two thousand"). Both are valid.
-- If the speaker uses future tense (e.g. "nitatuma" / "I will send" / "nitalipa" / "I will pay") without saying they already paid, this is NOT a completed deposit — it is "late_payment_note".
+- If the speaker uses future tense (e.g. "nitatuma" / "I will send" / "nitalipa" / "I will pay") without saying they already paid, this is NOT a completed deposit, it is "late_payment_note".
 - Vague quantity words (e.g. "kidogo" / "a little" / "some") are NOT numbers. Never convert them into a numeric guess.
 - referenced_member must be an actual person's name, never a number or group description, and never {speaker_name} unless {speaker_name} refers to themselves. If none, use "none".
 - If the speaker is COMMANDING a regular scheduled payout be sent to a member (e.g. "Tuma X kwa Y"), this is "initiate_scheduled_payout".
@@ -418,7 +300,7 @@ Correct extraction: {{"reasoning": "Speaker completed an action ('nimetuma'). 'K
 
 Example 3:
 Transcript: "Tuma elfu mbili kwa Grace leo."
-Correct extraction: {{"reasoning": "Speaker is issuing a command to send a scheduled payout to another member, Grace — not the speaker.", "speaker_action": "initiate_scheduled_payout", "amount": 2000, "referenced_member": "Grace", "referenced_member_context": "payout recipient", "action_type": "payout", "loan_duration_months": null}}
+Correct extraction: {{"reasoning": "Speaker is issuing a command to send a scheduled payout to another member, Grace, not the speaker.", "speaker_action": "initiate_scheduled_payout", "amount": 2000, "referenced_member": "Grace", "referenced_member_context": "payout recipient", "action_type": "payout", "loan_duration_months": null}}
 
 Example 4:
 Transcript: "Naomba mkopo wa elfu tano."
@@ -451,6 +333,159 @@ Respond with ONLY valid JSON in this exact structure, no other text:
     return json.loads(response.choices[0].message.content)
 
 
+def get_member_loan_context(member_name):
+    """Real, computed loan figures for this member, used so Bongo's follow-up answers (penalty in KES,
+    first payment date, etc.) come from actual numbers, never estimates from memory."""
+    context = {"pending_loan": None, "approved_loans": []}
+
+    pending = get_pending_loan_for_member(member_name)
+    if pending:
+        dur = pending.get("suggested_duration_months", 4)
+        est = calculate_loan_estimate(pending["amount"], dur)
+        penalty_kes = round(pending["amount"] * PENALTY_RATE_PER_MONTH_LATE, 2)
+        context["pending_loan"] = {
+            "amount": pending["amount"],
+            "duration_months": dur,
+            "estimated_monthly_payment": est["monthly"],
+            "estimated_total_repayable": est["total"],
+            "penalty_per_late_payment_kes": penalty_kes,
+            "first_payment_note": "First payment will be due 30 days after admin approval, not yet approved, so no exact date yet."
+        }
+
+    for lr in st.session_state.loan_requests:
+        if lr["member"] == member_name and lr["status"] == "approved":
+            lr = update_schedule_penalties(lr)
+            first_due = lr["schedule"][0]["due_date"] if lr.get("schedule") else None
+            context["approved_loans"].append({
+                "principal": lr["amount"],
+                "monthly_payment": lr["monthly_payment"],
+                "total_repayable": lr["total_repayable"],
+                "penalty_per_late_payment_kes": round(lr["monthly_payment"] * PENALTY_RATE_PER_MONTH_LATE, 2),
+                "first_payment_due_date": first_due,
+                "installment_schedule": lr["schedule"],
+            })
+
+    return context
+
+
+def answer_member_query(transcript, member_name, is_admin):
+    member_record = dict(MOCK_MEMBERS.get(member_name, {}))
+    member_record["loans"] = get_member_loan_context(member_name)
+    fallback_contact = "customer service" if is_admin else "the chama admin"
+
+    prompt = f"""You are {BONGO_NAME}, a friendly chama (savings group) voice assistant, speaking DIRECTLY
+to the person whose data this is. The message may be in English, Swahili, or a mix.
+
+ALWAYS address the speaker as "you" / "your", this data belongs to them personally. Never refer to them
+by name in the third person (e.g. never say "Juma's balance is...", say "your balance is...").
+
+There are four kinds of questions you might be asked:
+1. Questions about THEIR OWN account or loans (balance, when they last paid, loan terms, penalty amounts,
+   first payment date). Answer using ONLY the data provided below, including the "loans" section. Penalties
+   are always 2% of the relevant amount (the loan principal if not yet approved, or that month's installment
+   if approved), use the exact penalty_per_late_payment_kes figures already computed in the data, do not
+   recalculate or guess.
+2. Questions asking what a TERM or CONCEPT means. Answer in plain, simple language.
+3. Questions asking HOW something works or HOW to do something (e.g. "how do I request a loan", "how can I
+   schedule a payment reminder", "ninawezaje kuomba mkopo"), this is a CLARIFICATION, not a request. Explain
+   the process in plain language (mention relevant numbers like their own eligibility, or the interest/fee/
+   penalty rates, if helpful), then end by offering to help them actually do it, e.g. "Would you like me to
+   start that for you now, just tell me the amount." Do NOT treat this as if the action has already happened.
+4. Anything you cannot answer from the data below or a general explanation, do NOT guess or invent an
+   answer. Instead, respond exactly along these lines: "I don't have that information, please contact
+   {fallback_contact} for help with that."
+
+Member data for {member_name} (illustrative demo data): {json.dumps(member_record)}
+
+Question: "{transcript}"
+
+Give a short, direct, spoken-style answer (1-3 sentences, up to 4 for process explanations)."""
+    response = groq_client.chat.completions.create(
+        model="llama-3.1-8b-instant",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0
+    )
+    return response.choices[0].message.content
+
+
+def answer_payout_rotation_query(member_name, is_admin):
+    """Members get only position numbers (no names). Admins get the recipient's name and their own date too."""
+    positions_sorted = sorted(MOCK_MEMBERS.items(), key=lambda x: x[1]["payout_position"])
+    next_position, next_name = None, None
+    for name, data in positions_sorted:
+        pos = data["payout_position"]
+        if pos not in st.session_state.payouts_made_positions:
+            next_position, next_name = pos, name
+            break
+
+    my_position = MOCK_MEMBERS.get(member_name, {}).get("payout_position")
+
+    if is_admin:
+        next_date = st.session_state.payout_schedule.get(next_position)
+        my_date = st.session_state.payout_schedule.get(my_position)
+        return (
+            f"Position {next_position} is next, that's {next_name}, scheduled for "
+            f"{next_date.strftime('%d/%m/%Y') if next_date else 'an unset date'}. "
+            f"Your own payout (position {my_position}) is scheduled for "
+            f"{my_date.strftime('%d/%m/%Y') if my_date else 'an unset date'}."
+        )
+    else:
+        return f"Position {next_position} is next in line to receive the payout. You are position {my_position}."
+
+
+def answer_admin_aggregate_query(transcript):
+    """Answers bookkeeping-style questions from real session data, filtered as requested. Admin-only, never called for members."""
+    approved = [lr for lr in st.session_state.loan_requests if lr["status"] == "approved"]
+    this_month_start = date(st.session_state.simulated_today.year, st.session_state.simulated_today.month, 1)
+
+    this_month_loans = []
+    for lr in approved:
+        approval_date_str = lr.get("approval_date")
+        if not approval_date_str:
+            continue
+        try:
+            approval_dt = pd.to_datetime(approval_date_str, format="%d/%m/%Y").date()
+        except (ValueError, TypeError):
+            continue
+        if approval_dt >= this_month_start:
+            this_month_loans.append(lr)
+
+    total_this_month = sum(lr["amount"] for lr in this_month_loans)
+
+    summary_data = {
+        "loans_approved_this_month_count": len(this_month_loans),
+        "loans_approved_this_month_total": total_this_month,
+        "total_pending_loan_requests": len([lr for lr in st.session_state.loan_requests if lr["status"] == "pending"]),
+        "total_rejected_loan_requests": len([lr for lr in st.session_state.loan_requests if lr["status"] == "rejected"]),
+        "members_not_paid_this_month": [n for n, d in MOCK_MEMBERS.items() if not d["this_month_paid"]],
+        "total_owed_group_wide": sum(d["owed"] for d in MOCK_MEMBERS.values()),
+    }
+
+    prompt = f"""You are {BONGO_NAME}, a chama admin assistant with full bookkeeping access.
+Answer using ONLY this data, do not invent numbers. If the question cannot be answered from this data,
+say: "I don't have that information, please contact customer service for help with that."
+
+Data: {json.dumps(summary_data)}
+
+Question: "{transcript}"
+
+Give a short, direct spoken-style answer (1-2 sentences)."""
+    response = groq_client.chat.completions.create(
+        model="llama-3.1-8b-instant",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0
+    )
+
+    table = [{"Member": lr["member"], "Amount": lr["amount"], "Approved": lr.get("approval_date", "N/A")} for lr in this_month_loans]
+    return response.choices[0].message.content, table
+
+
+def answer_restricted_query(member_name):
+    """Fallback for members asking admin-only aggregate questions, states the restriction, then offers what they CAN know."""
+    my_eligible = MOCK_MEMBERS.get(member_name, {}).get("loan_eligible", 0)
+    return f"That information isn't available to members, it's for group administrators only. What I can tell you: you're eligible for a loan of up to {my_eligible}."
+
+
 def validate_extraction(transcript, extracted):
     if extracted.get("amount") is not None:
         transcript_lower = transcript.lower()
@@ -463,7 +498,7 @@ def validate_extraction(transcript, extracted):
         elif extracted["amount"] is not None and extracted["amount"] < 100:
             has_scale_word = any(re.search(rf'\b{re.escape(w)}\b', transcript_lower) for w in SCALE_WORDS)
             if not has_scale_word:
-                extracted["_flag"] = f"amount {extracted['amount']} may be missing a scale word (elfu/mia/thousand) — possible transcription drop"
+                extracted["_flag"] = f"amount {extracted['amount']} may be missing a scale word (elfu/mia/thousand), possible transcription drop"
     if extracted.get("speaker_action") not in VALID_SPEAKER_ACTIONS:
         extracted["_flag_invalid_speaker_action"] = extracted.get("speaker_action")
         extracted["speaker_action"] = "other"
@@ -484,13 +519,13 @@ Respond with ONLY valid JSON in this exact structure:
 {{"reference_type": "...", "weekday": "...", "days_ahead": ..., "explicit_day": ..., "explicit_month": ...}}
 
 Where reference_type is exactly one of:
-- "weekday" (e.g. "next Friday", "Ijumaa ijayo", "Jumatatu") — set "weekday" to the English weekday name (Monday..Sunday)
+- "weekday" (e.g. "next Friday", "Ijumaa ijayo", "Jumatatu"), set "weekday" to the English weekday name (Monday..Sunday)
 - "tomorrow" (e.g. "kesho")
 - "day_after_tomorrow" (e.g. "keshokutwa")
 - "next_week" (e.g. "wiki ijayo", generic, no specific day named)
 - "next_month" (e.g. "mwezi ujao", "next month")
-- "in_days" (e.g. "in three days") — set "days_ahead" to the integer number of days
-- "explicit_date" (a specific calendar date was stated) — set "explicit_day" (1-31) and "explicit_month" (1-12)
+- "in_days" (e.g. "in three days"), set "days_ahead" to the integer number of days
+- "explicit_date" (a specific calendar date was stated), set "explicit_day" (1-31) and "explicit_month" (1-12)
 - "unclear" (no usable date reference found)
 
 Set fields that don't apply to null. Respond with ONLY the JSON, no other text."""
@@ -557,7 +592,7 @@ def check_scheduled_payout_eligibility(member_name, amount, viewer=None):
         return False, f"{verb} not due yet. Scheduled date is {scheduled_date.strftime('%d/%m/%Y')}, today is {today.strftime('%d/%m/%Y')}."
 
     verb_are = "are" if is_self else "is"
-    return True, f"{subject} {verb_are} eligible — scheduled date {scheduled_date.strftime('%d/%m/%Y')} has been reached. [SIMULATED] Would send {amount} to {'your' if is_self else 'their'} registered phone number."
+    return True, f"{subject} {verb_are} eligible, scheduled date {scheduled_date.strftime('%d/%m/%Y')} has been reached. [SIMULATED] Would send {amount} to {'your' if is_self else 'their'} registered phone number."
 
 
 def mark_scheduled_payout_made(member_name):
@@ -648,7 +683,7 @@ def generate_confirmation_text(entry):
     if entry["speaker_action"] == "deposit":
         text = f"Confirmed: deposit of {entry['amount']} logged."
         if entry["referenced_member"] != "none":
-            text += f" Noted: {entry['referenced_member']} — {entry['referenced_member_context']}."
+            text += f" Noted: {entry['referenced_member']}, {entry['referenced_member_context']}."
     elif entry["speaker_action"] == "initiate_scheduled_payout":
         text = f"Checking scheduled payout for {entry['referenced_member']}."
     elif entry["speaker_action"] == "initiate_loan_payout":
@@ -773,7 +808,7 @@ if "loan_summary_duration" not in st.session_state:
 st.sidebar.title("🎙️ Habahub")
 st.sidebar.markdown(f"**{CURRENT_USER}** ({'Admin' if IS_ADMIN else 'Member'})")
 st.sidebar.divider()
-page = st.sidebar.radio("Navigate", ["Dashboard", "Record & Query", "Benchmark Data"])
+page = st.sidebar.radio("Navigate", ["Overview", "Dashboard", "Record & Query", "Benchmark Data"])
 
 def render_header(title):
     col1, col2 = st.columns([5, 1])
@@ -789,21 +824,148 @@ def render_header(title):
             if new_user != CURRENT_USER:
                 st.session_state.current_user_name = new_user
                 st.rerun()
-            st.button("Log out", disabled=True, help="Demo only — not functional")
+            st.button("Log out", disabled=True, help="Demo only, not functional")
 
 speaking_as = CURRENT_USER
+
+# ============================================================
+# PAGE 0: Overview
+# ============================================================
+if page == "Overview":
+    st.markdown(
+        """
+        <div style="text-align:center; padding: 30px 10px 10px 10px;">
+            <h1 style="color:#1F7A5C; margin-bottom:0;">🎙️ Habahub</h1>
+            <p style="font-size:1.2rem; color:#22332C; margin-top:4px;">Run your chama by voice, in the language you actually speak.</p>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+    st.markdown("### Why Use Habahub?")
+    b1, b2, b3 = st.columns(3)
+    with b1:
+        st.markdown("##### 🗣️ Speak Naturally")
+        st.write("Talk in English, Swahili, or a natural mix of both. No forms, no typing, no jargon you have to learn first.")
+    with b2:
+        st.markdown("##### 🤖 Bongo Takes Action")
+        st.write("Bongo does not just transcribe. It checks eligibility, calculates loan terms, schedules reminders, and updates records on your behalf.")
+    with b3:
+        st.markdown("##### 🔒 Built for Trust")
+        st.write("Role based access, human review before anything is logged, and suspicious activity flagged automatically for the admin.")
+
+    st.divider()
+
+    st.markdown("### What You Can Do")
+    st.markdown(
+        """
+        - **Manage rotation payouts** track whose turn it is and when they are scheduled to receive their payout
+        - **Request and approve loans** members ask by voice, Bongo checks real eligibility, admins review and approve
+        - **Track contributions and payments** log deposits, late payment notes, and see monthly history at a glance
+        - **Gain financial knowledge** ask Bongo what a term means and get a plain language answer, no jargon required
+        """
+    )
+
+    st.divider()
+
+    st.markdown("### How It Works")
+    s1, s2, s3 = st.columns(3)
+    with s1:
+        st.markdown("**1. Speak**")
+        st.write("Record a message to Bongo about a payment, a loan, or a question.")
+    with s2:
+        st.markdown("**2. Bongo Understands**")
+        st.write("Your speech is transcribed and understood, then you review the details before anything is submitted.")
+    with s3:
+        st.markdown("**3. It Happens**")
+        st.write("Bongo checks the rules, confirms out loud, and keeps the group's records up to date.")
+
+    st.divider()
+
+    st.markdown("## About This Submission")
+    st.caption("Answers to the challenge's 8 required questions, also used as the demo script.")
+
+    with st.expander("1. What problem does this solve?", expanded=True):
+        st.write(
+            "Many chama members, especially those less familiar with modern financial or digital "
+            "terminology, find it hard to manage contributions, loan requests, and payout rotations "
+            "using apps built around forms and jargon. Manual, verbal tracking is common but error "
+            "prone and hard to audit."
+        )
+
+    with st.expander("2. Who are the target users?"):
+        st.write(
+            "Members and administrators of informal savings groups (chamas) across East Africa, "
+            "particularly people who are comfortable speaking but not necessarily typing or navigating "
+            "complex financial software, and who naturally code switch between Swahili and English."
+        )
+
+    with st.expander("3. How does the solution solve the problem?"):
+        st.write(
+            "A voice agent, Bongo, lets members speak naturally to log deposits, request loans, ask "
+            "questions, and receive scheduled payouts. Every action is reviewed by the human before it "
+            "is submitted, and Bongo explains results back in plain spoken language rather than raw numbers."
+        )
+
+    with st.expander("4. How is code switching support handled?"):
+        st.write(
+            "Sahara, Whisper, and MMS were benchmarked on the same real code switched Swahili English "
+            "audio, using a word overlap accuracy metric. Sahara was selected as the production model "
+            "for its stronger structural coherence on mixed language sentences, with its specific "
+            "weaknesses, such as instability on financial terms, documented in the benchmark report "
+            "and mitigated with code level validation rather than blind trust in the transcript."
+        )
+
+    with st.expander("5. How is the Sahara API used?"):
+        st.write(
+            "Sahara's synchronous file upload endpoint transcribes every voice message, with the "
+            "language parameter set for Swahili to improve code switched accuracy. Sahara's text to "
+            "speech endpoint generates every spoken reply Bongo gives back, so the interaction is "
+            "voice in, voice out."
+        )
+
+    with st.expander("6. What makes this agentic, not just transcription?"):
+        st.write(
+            "Bongo takes real downstream action rather than only converting speech to text. It checks "
+            "loan eligibility against a member's actual limit before allowing a request to proceed, "
+            "calculates interest, fees, and penalties, verifies whether a scheduled payout is actually "
+            "due before releasing it, schedules payment reminders it derives from what was said, and "
+            "flags suspicious identity claims for admin review, all without the user needing to know "
+            "those rules exist."
+        )
+
+    with st.expander("7. What is the technical overview?"):
+        st.write(
+            "A Streamlit application calling Sahara for speech to text and text to speech, and Groq's "
+            "llama 3.1 8b instant model for intent classification, structured action extraction, and "
+            "question answering. Financial logic, such as loan schedules, penalty accrual, and payout "
+            "eligibility, is computed in plain Python rather than left to the language model, so the "
+            "numbers a user hears are always calculated deterministically, not guessed."
+        )
+
+    with st.expander("8. What ethics, safety, and inclusion considerations were addressed?"):
+        st.write(
+            "All financial data shown is clearly labeled illustrative demo data, and every payout or "
+            "loan disbursement is explicitly marked simulated with no real funds ever moved. Role based "
+            "access limits what each member can see or do on a need to know basis, extraction results "
+            "are always reviewed by a human before being logged, and known limitations, including "
+            "UI level rather than authenticated login, a flat interest simplification, and an assumed "
+            "penalty rate, are disclosed rather than hidden. An impersonation check flags any attempt "
+            "by a member to claim a different identity to gain unauthorized access."
+        )
+
 
 # ============================================================
 # PAGE 1: Record & Query
 # ============================================================
 if page == "Record & Query":
     render_header("Record & Query")
-    st.caption(f"Logged in as: {speaking_as} — talking with {BONGO_NAME}")
+    st.caption(f"Logged in as: {speaking_as}, talking with {BONGO_NAME}")
 
     col_main, col_chat = st.columns([2, 1])
 
     with col_main:
-        st.write("Speak a contribution, payment note, loan request, or update — or ask about your account, the payout rotation, or what a term means — in English, Swahili, or both.")
+        st.write("Speak a contribution, payment note, loan request, or update, or ask about your account, the payout rotation, or what a term means, in English, Swahili, or both.")
         audio = st.audio_input("Record your message")
 
         if audio is not None:
@@ -818,20 +980,45 @@ if page == "Record & Query":
                     f.write(audio_bytes)
 
                 with st.spinner("Transcribing..."):
+                    t0 = time.time()
                     transcript = transcribe_sahara("temp_input.wav")
+                    t_stt = time.time() - t0
                 st.session_state.current_transcript = transcript
                 log_chat(speaking_as, "user", transcript)
 
                 with st.spinner("Understanding your message..."):
+                    t0 = time.time()
                     intent = classify_intent(transcript)
+                    t_intent = time.time() - t0
                 st.session_state.current_intent = intent
 
                 if intent != "question":
                     with st.spinner("Extracting details..."):
+                        t0 = time.time()
                         extracted_raw = extract_chama_action(transcript, speaking_as)
                         extracted = json.loads(extracted_raw) if isinstance(extracted_raw, str) else extracted_raw
                         extracted = validate_extraction(transcript, extracted)
+                        t_extract = time.time() - t0
                     st.session_state.current_extracted = extracted
+                    st.caption(f"⏱️ STT: {t_stt:.1f}s · intent: {t_intent:.1f}s · extraction: {t_extract:.1f}s")
+
+                    st.session_state.current_impersonation = None
+                    if not IS_ADMIN:
+                        with st.spinner("Verifying request..."):
+                            imp_check = detect_impersonation(transcript, speaking_as)
+                        if imp_check.get("impersonation_detected"):
+                            st.session_state.current_impersonation = imp_check
+                            st.session_state.suspicious_activity_log.append({
+                                "logged_in_as": speaking_as,
+                                "claimed_identity": imp_check.get("claimed_identity", "unknown"),
+                                "transcript": transcript,
+                                "attempted_action": extracted.get("speaker_action", "unknown"),
+                                "attempted_amount": extracted.get("amount"),
+                                "reason": imp_check.get("reason", ""),
+                                "status": "unreviewed"
+                            })
+                else:
+                    st.caption(f"⏱️ STT: {t_stt:.1f}s · intent: {t_intent:.1f}s")
 
             transcript = st.session_state.current_transcript
             intent = st.session_state.current_intent
@@ -850,6 +1037,7 @@ if page == "Record & Query":
 
             if intent == "question":
                 with st.spinner("Checking records..."):
+                    t0 = time.time()
                     category = classify_query_category(transcript)
                     loan_table = None
                     if category == "payout_rotation":
@@ -861,226 +1049,251 @@ if page == "Record & Query":
                             answer = answer_restricted_query(speaking_as)
                     else:
                         answer = answer_member_query(transcript, speaking_as, IS_ADMIN)
+                    t_answer = time.time() - t0
+                answer = clean_agent_text(answer)
                 st.write("**Answer:**", answer)
                 if loan_table:
                     st.dataframe(pd.DataFrame(loan_table), use_container_width=True, hide_index=True)
                 log_chat(speaking_as, "bongo", answer)
                 with st.spinner("Generating spoken answer..."):
+                    t0 = time.time()
                     audio_url = generate_tts(answer)
+                    t_tts = time.time() - t0
                 st.audio(audio_url)
+                st.caption(f"⏱️ Answer + category: {t_answer:.1f}s · TTS: {t_tts:.1f}s")
 
             else:
-                extracted = st.session_state.current_extracted
-                st.json(extracted)
+                impersonation = st.session_state.get("current_impersonation")
+                if impersonation:
+                    st.error("🚨 This request could not be processed and has been flagged for admin review.")
+                    flag_msg = clean_agent_text(
+                        "I could not process that request. It has been flagged to the admin for review."
+                    )
+                    log_chat(speaking_as, "bongo", flag_msg)
+                    st.write(f"**{BONGO_NAME}:**", flag_msg)
+                    with st.spinner("Generating spoken notice..."):
+                        audio_url = generate_tts(flag_msg)
+                    st.audio(audio_url)
 
-                if "_flag" in extracted:
-                    st.warning(f"⚠️ {extracted['_flag']}")
-                if "_flag_invalid_speaker_action" in extracted:
-                    st.warning(f"⚠️ Unrecognized action type: '{extracted['_flag_invalid_speaker_action']}' — defaulted to 'other'.")
-
-                allowed_actions = list(ADMIN_ALLOWED_ACTIONS) if IS_ADMIN else list(MEMBER_ALLOWED_ACTIONS)
-                if extracted["speaker_action"] not in allowed_actions:
-                    st.warning(f"⚠️ '{extracted['speaker_action']}' is not permitted for your role. Defaulted to 'other'.")
-                    extracted["speaker_action"] = "other"
-
-                st.subheader("Review before submitting")
-                edited_speaker_action = st.selectbox(
-                    "Action", allowed_actions,
-                    index=allowed_actions.index(extracted["speaker_action"])
-                )
-                edited_amount = st.number_input(
-                    "Amount", value=float(extracted["amount"]) if extracted["amount"] is not None else 0.0,
-                    min_value=0.0, step=1.0
-                )
-
-                if IS_ADMIN:
-                    edited_referenced_member = st.text_input("Referenced member", value=extracted["referenced_member"])
                 else:
-                    st.text_input("Referenced member", value="none", disabled=True, help="Members can only log actions about themselves.")
-                    edited_referenced_member = "none"
+                    extracted = st.session_state.current_extracted
+                    st.json(extracted)
 
-                if st.button("Confirm and submit"):
-                    if not IS_ADMIN and edited_referenced_member not in ("none", CURRENT_USER):
-                        st.error("❌ Members can only log actions about themselves.")
-                    else:
-                        was_amended = (
-                            edited_speaker_action != extracted["speaker_action"]
-                            or (extracted["amount"] is not None and edited_amount != extracted["amount"])
-                            or (extracted["amount"] is None and edited_amount != 0.0)
-                            or edited_referenced_member != extracted["referenced_member"]
-                        )
-                        ai_action_taken = False
-
-                        final_entry = dict(extracted)
-                        final_entry["speaker"] = speaking_as
-                        final_entry["speaker_action"] = edited_speaker_action
-                        final_entry["amount"] = edited_amount if edited_amount > 0 else None
-                        final_entry["referenced_member"] = edited_referenced_member
-                        final_entry["amended_by_human"] = was_amended
-                        final_entry["ai_original_amount"] = extracted["amount"]
-                        final_entry["ai_original_speaker_action"] = extracted["speaker_action"]
-
-                        confirmation_text = generate_confirmation_text(final_entry)
-                        block_loan_request = False
-
-                        if edited_speaker_action == "loan_request":
-                            eligible, elig_message = check_loan_eligibility(speaking_as, edited_amount, viewer=speaking_as)
-                            ai_action_taken = True
-                            if not eligible:
-                                block_loan_request = True
-                                confirmation_text = f"Sorry — {elig_message}"
-                                st.error(f"❌ {elig_message}")
-                            else:
-                                st.session_state.pending_loan_review = {"member": speaking_as, "amount": edited_amount}
-                                confirmation_text = f"Your requested amount of {edited_amount} is within your eligible limit. Let's set up the repayment details below."
-
-                        if edited_speaker_action == "initiate_scheduled_payout" and IS_ADMIN and edited_referenced_member not in ("none", ""):
-                            eligible, elig_message = check_scheduled_payout_eligibility(edited_referenced_member, edited_amount, viewer=speaking_as)
-                            ai_action_taken = True
-                            if eligible:
-                                mark_scheduled_payout_made(edited_referenced_member)
-                                st.success(f"✅ SIMULATED PAYMENT — {elig_message}")
-                                confirmation_text += f" Payment of {edited_amount} sent to {edited_referenced_member}. Simulated transaction — no real funds moved. Their schedule has been updated to the next cycle."
-                            else:
-                                st.error(f"❌ Payment blocked (simulated check) — {elig_message}")
-                                confirmation_text += f" Payment blocked. {elig_message}"
-
-                        if edited_speaker_action == "initiate_loan_payout" and IS_ADMIN and edited_referenced_member not in ("none", ""):
-                            ai_action_taken = True
-                            pending_loan = get_pending_loan_for_member(edited_referenced_member)
-                            spoken_duration = extracted.get("loan_duration_months")
-                            if not pending_loan:
-                                st.error(f"❌ No pending loan request found for {edited_referenced_member}.")
-                                confirmation_text += f" No pending loan request found for {edited_referenced_member}."
-                            elif not spoken_duration:
-                                st.error("❌ Please state the loan duration in months (e.g. 'kwa miezi sita') before approving.")
-                                confirmation_text += " Please state the loan duration in months before approving."
-                            else:
-                                eligible, elig_message = check_loan_eligibility(edited_referenced_member, pending_loan["amount"], viewer=speaking_as)
-                                idx = st.session_state.loan_requests.index(pending_loan)
-                                if eligible:
-                                    terms = calculate_loan_terms(pending_loan["amount"], spoken_duration)
-                                    st.session_state.loan_requests[idx]["status"] = "approved"
-                                    st.session_state.loan_requests[idx].update(terms)
-                                    st.success(f"✅ SIMULATED LOAN PAYMENT — {elig_message} Monthly payment: {terms['monthly_payment']} over {spoken_duration} months.")
-                                    confirmation_text += f" Loan payout of {pending_loan['amount']} approved over {spoken_duration} months. Monthly payment: {terms['monthly_payment']}."
-                                else:
-                                    st.error(f"❌ Loan payout blocked — {elig_message}")
-                                    confirmation_text += f" Loan payout blocked. {elig_message}"
-
-                        final_entry["ai_action_taken"] = ai_action_taken
-                        if not block_loan_request:
-                            st.session_state.ledger.append(final_entry)
-
-                        if edited_speaker_action == "late_payment_note":
-                            with st.spinner("Working out the date you mentioned..."):
-                                ref = parse_commitment_date_reference(transcript)
-                                resolved_date = resolve_commitment_date(ref, st.session_state.simulated_today)
-                            st.session_state.show_reminder_offer = True
-                            st.session_state.reminder_offer_member = speaking_as
-                            st.session_state.reminder_offer_amount = final_entry.get("amount")
-                            st.session_state.reminder_offer_date = resolved_date
-                            st.session_state.reminder_offer_date_was_parsed = resolved_date is not None
-
-                        log_chat(speaking_as, "bongo", confirmation_text)
-                        with st.spinner("Generating spoken confirmation..."):
-                            audio_url = generate_tts(confirmation_text)
-                        st.write("**Confirmation:**", confirmation_text)
-                        st.audio(audio_url)
-
-                if st.session_state.pending_loan_review:
-                    st.divider()
-                    st.subheader(f"💬 {BONGO_NAME} needs a few more details")
-                    lr = st.session_state.pending_loan_review
-                    st.write(f"Before submitting your request for **{lr['amount']}**, choose your preferred repayment period.")
-                    suggested_duration = st.number_input(
-                        "Repayment period (months)", min_value=2, max_value=6, value=4, key="loan_req_duration"
+                    if "_flag" in extracted:
+                        st.warning(f"⚠️ {extracted['_flag']}")
+                    if "_flag_invalid_speaker_action" in extracted:
+                        st.warning(f"⚠️ Unrecognized action type: '{extracted['_flag_invalid_speaker_action']}', defaulted to 'other'.")
+    
+                    allowed_actions = list(ADMIN_ALLOWED_ACTIONS) if IS_ADMIN else list(MEMBER_ALLOWED_ACTIONS)
+                    if extracted["speaker_action"] not in allowed_actions:
+                        st.warning(f"⚠️ '{extracted['speaker_action']}' is not permitted for your role. Defaulted to 'other'.")
+                        extracted["speaker_action"] = "other"
+    
+                    st.subheader("Review before submitting")
+                    edited_speaker_action = st.selectbox(
+                        "Action", allowed_actions,
+                        index=allowed_actions.index(extracted["speaker_action"])
                     )
-
-                    if st.button(f"Get my loan summary from {BONGO_NAME}"):
-                        estimate = calculate_loan_estimate(lr["amount"], suggested_duration)
-                        penalty_kes = round(lr["amount"] * PENALTY_RATE_PER_MONTH_LATE, 2)
-                        summary_text = (
-                            f"Based on a loan of {lr['amount']} over {suggested_duration} months, at "
-                            f"{LOAN_REQUEST_DEFAULT_INTEREST*100:.0f}% interest and {LOAN_REQUEST_DEFAULT_FEE*100:.0f}% processing fee, "
-                            f"your total repayable amount is {estimate['total']}, meaning a monthly payment of {estimate['monthly']}. "
-                            f"If any payment is late, a penalty of {PENALTY_RATE_PER_MONTH_LATE*100:.0f} percent applies — "
-                            f"that's {penalty_kes} shillings per late payment. Your first payment will be due 30 days "
-                            f"after your loan is approved by the admin."
-                        )
-                        st.session_state.loan_summary_text = summary_text
-                        st.session_state.loan_summary_duration = suggested_duration
-                        log_chat(speaking_as, "bongo", summary_text)
-                        with st.spinner("Generating spoken summary..."):
-                            audio_url = generate_tts(summary_text)
-                        st.write(f"**{BONGO_NAME}:**", summary_text)
-                        st.audio(audio_url)
-
-                    if st.session_state.loan_summary_text:
-                        st.info(st.session_state.loan_summary_text)
-                        col1, col2 = st.columns(2)
-                        if col1.button("Submit to admin for approval"):
-                            st.session_state.loan_requests.append({
-                                "member": lr["member"],
-                                "amount": lr["amount"],
-                                "suggested_duration_months": st.session_state.loan_summary_duration,
-                                "status": "pending"
-                            })
-                            st.success("✅ Loan request submitted to admin for approval.")
-                            st.session_state.pending_loan_review = None
-                            st.session_state.loan_summary_text = None
-                            st.rerun()
-                        if col2.button("Cancel request"):
-                            st.session_state.pending_loan_review = None
-                            st.session_state.loan_summary_text = None
-                            st.rerun()
-
-                if st.session_state.get("show_reminder_offer"):
-                    st.divider()
-                    st.subheader("📅 Schedule a payment reminder?")
-
-                    resolved_date = st.session_state.get("reminder_offer_date")
-                    was_parsed = st.session_state.get("reminder_offer_date_was_parsed")
-
-                    if was_parsed:
-                        st.write(f"Based on what you said, you're planning to pay on **{resolved_date.strftime('%A, %d/%m/%Y')}**. We can send a reminder that morning at 9:00 AM.")
-                    else:
-                        st.info("We couldn't work out the exact date you meant — please pick one below.")
-                        resolved_date = resolved_date or get_next_friday(st.session_state.simulated_today)
-
-                    reminder_date = st.date_input("Reminder date", value=resolved_date, min_value=st.session_state.simulated_today, key="reminder_date_input")
-
-                    existing_amount = st.session_state.reminder_offer_amount
-                    if existing_amount is None:
-                        st.info("No amount was mentioned in your message — please enter one to schedule the reminder.")
-                    reminder_amount = st.number_input(
-                        "Amount owed",
-                        value=float(existing_amount) if existing_amount is not None else 0.0,
-                        min_value=0.0, step=1.0,
-                        key="reminder_amount_input"
+                    edited_amount = st.number_input(
+                        "Amount", value=float(extracted["amount"]) if extracted["amount"] is not None else 0.0,
+                        min_value=0.0, step=1.0
                     )
-                    reminder_category = st.selectbox("Payment type", ["Monthly Contribution", "Loan"], key="reminder_category_input")
-
-                    if st.button("Yes, schedule reminder"):
-                        if reminder_amount <= 0:
-                            st.error("❌ Please enter an amount greater than 0 before scheduling.")
+    
+                    if IS_ADMIN:
+                        edited_referenced_member = st.text_input("Referenced member", value=extracted["referenced_member"])
+                    else:
+                        st.text_input("Referenced member", value="none", disabled=True, help="Members can only log actions about themselves.")
+                        edited_referenced_member = "none"
+    
+                    if st.button("Confirm and submit"):
+                        if not IS_ADMIN and edited_referenced_member not in ("none", CURRENT_USER):
+                            st.error("❌ Members can only log actions about themselves.")
                         else:
-                            st.session_state.scheduled_reminders.append({
-                                "member": st.session_state.reminder_offer_member,
-                                "amount": reminder_amount,
-                                "category": reminder_category,
-                                "date": reminder_date.strftime("%d/%m/%Y"),
-                                "time": "09:00",
-                                "status": "scheduled"
-                            })
-                            reminder_msg = f"Reminder scheduled for {reminder_date.strftime('%d/%m/%Y')} at 9:00 AM. No real SMS sent — simulated."
-                            log_chat(speaking_as, "bongo", reminder_msg)
-                            st.success(f"✅ SIMULATED — {reminder_category} reminder of {reminder_amount} scheduled for {st.session_state.reminder_offer_member} on {reminder_date.strftime('%d/%m/%Y')} at 9:00 AM. No real SMS sent.")
+                            was_amended = (
+                                edited_speaker_action != extracted["speaker_action"]
+                                or (extracted["amount"] is not None and edited_amount != extracted["amount"])
+                                or (extracted["amount"] is None and edited_amount != 0.0)
+                                or edited_referenced_member != extracted["referenced_member"]
+                            )
+                            ai_action_taken = False
+    
+                            final_entry = dict(extracted)
+                            final_entry["speaker"] = speaking_as
+                            final_entry["speaker_action"] = edited_speaker_action
+                            final_entry["amount"] = edited_amount if edited_amount > 0 else None
+                            final_entry["referenced_member"] = edited_referenced_member
+                            final_entry["amended_by_human"] = was_amended
+                            final_entry["ai_original_amount"] = extracted["amount"]
+                            final_entry["ai_original_speaker_action"] = extracted["speaker_action"]
+    
+                            confirmation_text = generate_confirmation_text(final_entry)
+                            block_loan_request = False
+    
+                            if edited_speaker_action == "loan_request":
+                                eligible, elig_message = check_loan_eligibility(speaking_as, edited_amount, viewer=speaking_as)
+                                ai_action_taken = True
+                                if not eligible:
+                                    block_loan_request = True
+                                    confirmation_text = f"Sorry, {elig_message}"
+                                    st.error(f"❌ {elig_message}")
+                                else:
+                                    st.session_state.pending_loan_review = {"member": speaking_as, "amount": edited_amount}
+                                    confirmation_text = f"Your requested amount of {edited_amount} is within your eligible limit. Let's set up the repayment details below."
+    
+                            if edited_speaker_action == "initiate_scheduled_payout" and IS_ADMIN and edited_referenced_member not in ("none", ""):
+                                eligible, elig_message = check_scheduled_payout_eligibility(edited_referenced_member, edited_amount, viewer=speaking_as)
+                                ai_action_taken = True
+                                if eligible:
+                                    mark_scheduled_payout_made(edited_referenced_member)
+                                    st.success(f"✅ SIMULATED PAYMENT, {elig_message}")
+                                    confirmation_text += f" Payment of {edited_amount} sent to {edited_referenced_member}. Simulated transaction, no real funds moved. Their schedule has been updated to the next cycle."
+                                else:
+                                    st.error(f"❌ Payment blocked (simulated check), {elig_message}")
+                                    confirmation_text += f" Payment blocked. {elig_message}"
+    
+                            if edited_speaker_action == "initiate_loan_payout" and IS_ADMIN and edited_referenced_member not in ("none", ""):
+                                ai_action_taken = True
+                                pending_loan = get_pending_loan_for_member(edited_referenced_member)
+                                spoken_duration = extracted.get("loan_duration_months")
+                                if not pending_loan:
+                                    st.error(f"❌ No pending loan request found for {edited_referenced_member}.")
+                                    confirmation_text += f" No pending loan request found for {edited_referenced_member}."
+                                elif not spoken_duration:
+                                    st.error("❌ Please state the loan duration in months (e.g. 'kwa miezi sita') before approving.")
+                                    confirmation_text += " Please state the loan duration in months before approving."
+                                else:
+                                    eligible, elig_message = check_loan_eligibility(edited_referenced_member, pending_loan["amount"], viewer=speaking_as)
+                                    idx = st.session_state.loan_requests.index(pending_loan)
+                                    if eligible:
+                                        terms = calculate_loan_terms(pending_loan["amount"], spoken_duration)
+                                        st.session_state.loan_requests[idx]["status"] = "approved"
+                                        st.session_state.loan_requests[idx].update(terms)
+                                        st.success(f"✅ SIMULATED LOAN PAYMENT, {elig_message} Monthly payment: {terms['monthly_payment']} over {spoken_duration} months.")
+                                        confirmation_text += f" Loan payout of {pending_loan['amount']} approved over {spoken_duration} months. Monthly payment: {terms['monthly_payment']}."
+                                    else:
+                                        st.error(f"❌ Loan payout blocked, {elig_message}")
+                                        confirmation_text += f" Loan payout blocked. {elig_message}"
+    
+                            final_entry["ai_action_taken"] = ai_action_taken
+                            if not block_loan_request:
+                                st.session_state.ledger.append(final_entry)
+    
+                            if edited_speaker_action == "late_payment_note":
+                                with st.spinner("Working out the date you mentioned..."):
+                                    ref = parse_commitment_date_reference(transcript)
+                                    resolved_date = resolve_commitment_date(ref, st.session_state.simulated_today)
+                                st.session_state.show_reminder_offer = True
+                                st.session_state.reminder_offer_member = speaking_as
+                                st.session_state.reminder_offer_amount = final_entry.get("amount")
+                                st.session_state.reminder_offer_date = resolved_date
+                                st.session_state.reminder_offer_date_was_parsed = resolved_date is not None
+    
+                            confirmation_text = clean_agent_text(confirmation_text)
+                            log_chat(speaking_as, "bongo", confirmation_text)
+                            with st.spinner("Generating spoken confirmation..."):
+                                t0 = time.time()
+                                audio_url = generate_tts(confirmation_text)
+                                t_tts = time.time() - t0
+                            st.write("**Confirmation:**", confirmation_text)
+                            st.audio(audio_url)
+                            st.caption(f"⏱️ TTS: {t_tts:.1f}s")
+    
+                    if st.session_state.pending_loan_review:
+                        st.divider()
+                        st.subheader(f"💬 {BONGO_NAME} needs a few more details")
+                        lr = st.session_state.pending_loan_review
+                        st.write(f"Before submitting your request for **{lr['amount']}**, choose your preferred repayment period.")
+                        suggested_duration = st.number_input(
+                            "Repayment period (months)", min_value=2, max_value=6, value=4, key="loan_req_duration"
+                        )
+    
+                        if st.button(f"Get my loan summary from {BONGO_NAME}"):
+                            estimate = calculate_loan_estimate(lr["amount"], suggested_duration)
+                            penalty_kes = round(lr["amount"] * PENALTY_RATE_PER_MONTH_LATE, 2)
+                            summary_text = (
+                                f"Based on a loan of {lr['amount']} over {suggested_duration} months, at "
+                                f"{LOAN_REQUEST_DEFAULT_INTEREST*100:.0f}% interest and {LOAN_REQUEST_DEFAULT_FEE*100:.0f}% processing fee, "
+                                f"your total repayable amount is {estimate['total']}, meaning a monthly payment of {estimate['monthly']}. "
+                                f"If any payment is late, a penalty of {PENALTY_RATE_PER_MONTH_LATE*100:.0f} percent applies, "
+                                f"that's {penalty_kes} shillings per late payment. Your first payment will be due 30 days "
+                                f"after your loan is approved by the admin."
+                            )
+                            st.session_state.loan_summary_text = summary_text
+                            st.session_state.loan_summary_duration = suggested_duration
+                            summary_text = clean_agent_text(summary_text)
+                            st.session_state.loan_summary_text = summary_text
+                            log_chat(speaking_as, "bongo", summary_text)
+                            with st.spinner("Generating spoken summary..."):
+                                audio_url = generate_tts(summary_text)
+                            st.write(f"**{BONGO_NAME}:**", summary_text)
+                            st.audio(audio_url)
+    
+                        if st.session_state.loan_summary_text:
+                            st.info(st.session_state.loan_summary_text)
+                            col1, col2 = st.columns(2)
+                            if col1.button("Submit to admin for approval"):
+                                st.session_state.loan_requests.append({
+                                    "member": lr["member"],
+                                    "amount": lr["amount"],
+                                    "suggested_duration_months": st.session_state.loan_summary_duration,
+                                    "status": "pending"
+                                })
+                                st.success("✅ Loan request submitted to admin for approval.")
+                                st.session_state.pending_loan_review = None
+                                st.session_state.loan_summary_text = None
+                                st.rerun()
+                            if col2.button("Cancel request"):
+                                st.session_state.pending_loan_review = None
+                                st.session_state.loan_summary_text = None
+                                st.rerun()
+    
+                    if st.session_state.get("show_reminder_offer"):
+                        st.divider()
+                        st.subheader("📅 Schedule a payment reminder?")
+    
+                        resolved_date = st.session_state.get("reminder_offer_date")
+                        was_parsed = st.session_state.get("reminder_offer_date_was_parsed")
+    
+                        if was_parsed:
+                            st.write(f"Based on what you said, you're planning to pay on **{resolved_date.strftime('%A, %d/%m/%Y')}**. We can send a reminder that morning at 9:00 AM.")
+                        else:
+                            st.info("We couldn't work out the exact date you meant, please pick one below.")
+                            resolved_date = resolved_date or get_next_friday(st.session_state.simulated_today)
+    
+                        reminder_date = st.date_input("Reminder date", value=resolved_date, min_value=st.session_state.simulated_today, key="reminder_date_input")
+    
+                        existing_amount = st.session_state.reminder_offer_amount
+                        if existing_amount is None:
+                            st.info("No amount was mentioned in your message, please enter one to schedule the reminder.")
+                        reminder_amount = st.number_input(
+                            "Amount owed",
+                            value=float(existing_amount) if existing_amount is not None else 0.0,
+                            min_value=0.0, step=1.0,
+                            key="reminder_amount_input"
+                        )
+                        reminder_category = st.selectbox("Payment type", ["Monthly Contribution", "Loan"], key="reminder_category_input")
+    
+                        if st.button("Yes, schedule reminder"):
+                            if reminder_amount <= 0:
+                                st.error("❌ Please enter an amount greater than 0 before scheduling.")
+                            else:
+                                st.session_state.scheduled_reminders.append({
+                                    "member": st.session_state.reminder_offer_member,
+                                    "amount": reminder_amount,
+                                    "category": reminder_category,
+                                    "date": reminder_date.strftime("%d/%m/%Y"),
+                                    "time": "09:00",
+                                    "status": "scheduled"
+                                })
+                                reminder_msg = f"Reminder scheduled for {reminder_date.strftime('%d/%m/%Y')} at 9:00 AM. No real SMS sent, simulated."
+                                reminder_msg = clean_agent_text(reminder_msg)
+                                log_chat(speaking_as, "bongo", reminder_msg)
+                                st.success(f"✅ SIMULATED, {reminder_category} reminder of {reminder_amount} scheduled for {st.session_state.reminder_offer_member} on {reminder_date.strftime('%d/%m/%Y')} at 9:00 AM. No real SMS sent.")
+                                st.session_state.show_reminder_offer = False
+                                st.rerun()
+                        if st.button("No thanks"):
                             st.session_state.show_reminder_offer = False
                             st.rerun()
-                    if st.button("No thanks"):
-                        st.session_state.show_reminder_offer = False
-                        st.rerun()
 
         st.divider()
         st.subheader("Session Ledger")
@@ -1088,7 +1301,7 @@ if page == "Record & Query":
 
     with col_chat:
         st.markdown(f"### 💬 Chat with {BONGO_NAME}")
-        st.caption("Your own conversation history — not visible to other users.")
+        st.caption("Your own conversation history, not visible to other users.")
         history = st.session_state.chat_history.get(speaking_as, [])
         chat_box = st.container(height=650)
         with chat_box:
@@ -1105,7 +1318,7 @@ if page == "Record & Query":
 # ============================================================
 elif page == "Dashboard":
     render_header("Dashboard")
-    st.caption("⚠️ Illustrative demo data — not live transaction history.")
+    st.caption("⚠️ Illustrative demo data, not live transaction history.")
 
     if IS_ADMIN:
         with st.expander("🛠️ Demo controls"):
@@ -1160,7 +1373,7 @@ elif page == "Dashboard":
                     if lr["status"] != "pending":
                         continue
                     st.write(f"**{lr['member']}** requests **{lr['amount']}**")
-                    with st.expander(f"Set terms and approve — {lr['member']}"):
+                    with st.expander(f"Set terms and approve, {lr['member']}"):
                         st.caption(f"Member suggested: {lr.get('suggested_duration_months', 4)} months")
                         fee_pct = st.number_input("Processing fee (%)", value=LOAN_REQUEST_DEFAULT_FEE*100, min_value=0.0, max_value=100.0, step=0.5, key=f"fee_{idx}")
                         interest_pct = st.number_input("Interest (%)", value=LOAN_REQUEST_DEFAULT_INTEREST*100, min_value=0.0, max_value=100.0, step=0.5, key=f"interest_{idx}")
@@ -1181,7 +1394,7 @@ elif page == "Dashboard":
                                     "amended_by_human": False,
                                     "ai_action_taken": True
                                 })
-                                st.success(f"✅ SIMULATED LOAN PAYMENT — {elig_message} Monthly payment: {terms['monthly_payment']} over {duration} months.")
+                                st.success(f"✅ SIMULATED LOAN PAYMENT, {elig_message} Monthly payment: {terms['monthly_payment']} over {duration} months.")
                                 st.rerun()
                             else:
                                 st.error(f"❌ {elig_message}")
@@ -1197,12 +1410,12 @@ elif page == "Dashboard":
                 for lr in approved:
                     lr = update_schedule_penalties(lr)
                     st.markdown(
-                        f"**{lr['member']}** — Principal: {lr['amount']} | "
+                        f"**{lr['member']}**, Principal: {lr['amount']} | "
                         f"Interest: {lr['interest_rate']*100:.0f}% ({lr['interest_amount']}) | "
                         f"Fee: {lr['processing_fee_rate']*100:.0f}% ({lr['processing_fee']}) | "
                         f"Total repayable: {lr['total_repayable']} | Monthly: {lr['monthly_payment']}"
                     )
-                    with st.expander(f"Payment schedule — {lr['member']}"):
+                    with st.expander(f"Payment schedule, {lr['member']}"):
                         st.dataframe(pd.DataFrame(lr["schedule"]), use_container_width=True, hide_index=True)
                     st.divider()
 
@@ -1214,7 +1427,7 @@ elif page == "Dashboard":
                 st.dataframe(pd.DataFrame(rejected), use_container_width=True, hide_index=True)
 
         st.subheader("Scheduled payment reminders")
-        st.caption("Members' self-reported commitments to pay late — for tracking, not enforcement.")
+        st.caption("Members' self-reported commitments to pay late, for tracking, not enforcement.")
         if not st.session_state.scheduled_reminders:
             st.info("No scheduled reminders yet.")
         else:
@@ -1225,9 +1438,33 @@ elif page == "Dashboard":
             })
             st.dataframe(display_df, use_container_width=True, hide_index=True)
 
+        st.subheader("🚨 Suspicious Activity")
+        st.caption("Attempts by a logged-in member to claim a different identity in order to request an action beyond their own authorization.")
+        if not st.session_state.suspicious_activity_log:
+            st.info("No suspicious activity flagged.")
+        else:
+            for i, incident in enumerate(st.session_state.suspicious_activity_log):
+                col1, col2 = st.columns([5, 1])
+                with col1:
+                    st.write(
+                        f"**Logged in as:** {incident['logged_in_as']} | "
+                        f"**Claimed to be:** {incident['claimed_identity']} | "
+                        f"**Status:** {incident['status']}"
+                    )
+                    st.caption(f"Said: \"{incident['transcript']}\"")
+                    st.caption(f"Attempted: {incident['attempted_action']}"
+                               + (f" of {incident['attempted_amount']}" if incident['attempted_amount'] else ""))
+                    st.caption(f"Reason flagged: {incident['reason']}")
+                with col2:
+                    if incident["status"] == "unreviewed":
+                        if st.button("Mark reviewed", key=f"review_incident_{i}"):
+                            st.session_state.suspicious_activity_log[i]["status"] = "reviewed"
+                            st.rerun()
+                st.divider()
+
     else:
         my_data = MOCK_MEMBERS.get(CURRENT_USER, {})
-        st.subheader(f"Your account — {CURRENT_USER}")
+        st.subheader(f"Your account, {CURRENT_USER}")
         col1, col2, col3 = st.columns(3)
         col1.metric("Your YTD contributions", f"KES {my_data.get('ytd_contributed', 0):,}")
         col2.metric("Paid this month", "✅" if my_data.get("this_month_paid") else "❌")
@@ -1252,7 +1489,7 @@ elif page == "Dashboard":
             st.info("No loan requests yet.")
         else:
             for lr in my_loans:
-                st.write(f"**Amount:** {lr['amount']} — **Status:** {lr['status']}")
+                st.write(f"**Amount:** {lr['amount']}, **Status:** {lr['status']}")
                 if lr["status"] == "approved":
                     lr = update_schedule_penalties(lr)
                     st.write(
@@ -1274,7 +1511,7 @@ elif page == "Dashboard":
 # ============================================================
 elif page == "Benchmark Data":
     render_header("Benchmark Data")
-    st.caption("⚠️ Storage here is temporary — tied to this browser session only. Download files before closing the tab or redeploying the app, or they will be lost.")
+    st.caption("⚠️ Storage here is temporary, tied to this browser session only. Download files before closing the tab or redeploying the app, or they will be lost.")
 
     if not st.session_state.benchmark_samples:
         st.info("No benchmark samples saved yet. Save recordings from the Record & Query page.")
@@ -1286,7 +1523,7 @@ elif page == "Benchmark Data":
             col1, col2 = st.columns([4, 1])
             with col1:
                 st.audio(sample["audio_bytes"])
-                new_gt = st.text_area(f"Ground truth — testcase{idx}", value=sample["ground_truth"], key=f"bench_gt_{i}", label_visibility="collapsed")
+                new_gt = st.text_area(f"Ground truth, testcase{idx}", value=sample["ground_truth"], key=f"bench_gt_{i}", label_visibility="collapsed")
             with col2:
                 if st.button("Update", key=f"bench_update_{i}"):
                     st.session_state.benchmark_samples[i]["ground_truth"] = new_gt

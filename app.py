@@ -182,13 +182,19 @@ def generate_tts(text, voice_accent="swahili", voice_gender="female", voice_lang
 def classify_intent(transcript):
     prompt = f"""Classify this chama voice message as either "statement" or "question".
 
-"statement" includes: reporting a completed or future action (deposit, payment), requesting a loan
-(e.g. "I want to borrow...", "Naomba mkopo..."), requesting a scheduled payout be sent, approving a loan
-payout for another member, or any message where the speaker wants an action taken or recorded —
-even if phrased politely as a request.
+"statement" means the speaker is DIRECTLY INITIATING an action right now, with enough specifics to act on
+(e.g. "I want to borrow 5000", "Naomba mkopo wa elfu tano", "Tuma pesa kwa Grace", "I've paid my
+contribution", "Approve Juma's loan"). This includes future-tense payment commitments like "Nitalipa
+Ijumaa" since those log a real commitment.
 
-"question" includes: purely seeking information with no action requested about their own account,
-about the payout rotation, group statistics, or definitions of terms.
+"question" means the speaker is seeking information, asking HOW something works, asking IF something is
+possible, or asking for clarification — even if the topic is loans, payouts, or payments — as long as they
+are NOT giving a specific amount/action to execute right now. Examples: "How do I apply for a loan?",
+"Ninawezaje kuomba mkopo?", "Can members borrow money?", "What happens if I pay late?", "When is my turn?".
+These are questions, not requests, even though they mention loans or payments.
+
+The key test: does the speaker give a concrete amount, name, or date to act on RIGHT NOW? If yes →
+statement. If they're only asking about process, possibility, or general information → question.
 
 Transcript: "{transcript}"
 
@@ -260,17 +266,25 @@ def answer_member_query(transcript, member_name, is_admin):
     member_record["loans"] = get_member_loan_context(member_name)
     fallback_contact = "customer service" if is_admin else "the chama admin"
 
-    prompt = f"""You are {BONGO_NAME}, a friendly chama (savings group) voice assistant, speaking to someone
-who may not be familiar with financial or chama terminology. The message may be in English, Swahili, or a mix.
+    prompt = f"""You are {BONGO_NAME}, a friendly chama (savings group) voice assistant, speaking DIRECTLY
+to the person whose data this is. The message may be in English, Swahili, or a mix.
 
-There are three kinds of questions you might be asked:
+ALWAYS address the speaker as "you" / "your" — this data belongs to them personally. Never refer to them
+by name in the third person (e.g. never say "Juma's balance is..." — say "your balance is...").
+
+There are four kinds of questions you might be asked:
 1. Questions about THEIR OWN account or loans (balance, when they last paid, loan terms, penalty amounts,
    first payment date). Answer using ONLY the data provided below, including the "loans" section. Penalties
    are always 2% of the relevant amount (the loan principal if not yet approved, or that month's installment
    if approved) — use the exact penalty_per_late_payment_kes figures already computed in the data, do not
    recalculate or guess.
 2. Questions asking what a TERM or CONCEPT means. Answer in plain, simple language.
-3. Anything you cannot answer from the data below or a general definition — do NOT guess or invent an
+3. Questions asking HOW something works or HOW to do something (e.g. "how do I request a loan", "how can I
+   schedule a payment reminder", "ninawezaje kuomba mkopo") — this is a CLARIFICATION, not a request. Explain
+   the process in plain language (mention relevant numbers like their own eligibility, or the interest/fee/
+   penalty rates, if helpful), then end by offering to help them actually do it, e.g. "Would you like me to
+   start that for you now — just tell me the amount." Do NOT treat this as if the action has already happened.
+4. Anything you cannot answer from the data below or a general explanation — do NOT guess or invent an
    answer. Instead, respond exactly along these lines: "I don't have that information — please contact
    {fallback_contact} for help with that."
 
@@ -278,7 +292,7 @@ Member data for {member_name} (illustrative demo data): {json.dumps(member_recor
 
 Question: "{transcript}"
 
-Give a short, direct, spoken-style answer (1-3 sentences)."""
+Give a short, direct, spoken-style answer (1-3 sentences, up to 4 for process explanations)."""
     response = groq_client.chat.completions.create(
         model="llama-3.1-8b-instant",
         messages=[{"role": "user", "content": prompt}],
@@ -523,22 +537,27 @@ def resolve_commitment_date(reference, today):
 # Payout / loan business logic
 # ============================================================
 
-def check_scheduled_payout_eligibility(member_name, amount):
+def check_scheduled_payout_eligibility(member_name, amount, viewer=None):
     member = MOCK_MEMBERS.get(member_name)
+    subject = personalize_subject(member_name, viewer)
+    is_self = subject == "you"
     if not member:
         return False, f"{member_name} is not a registered member."
 
     position = member["payout_position"]
     scheduled_date = st.session_state.payout_schedule[position]
     today = st.session_state.simulated_today
+    possessive = "your" if is_self else f"{member_name}'s"
 
     if position in st.session_state.payouts_made_positions:
-        return False, f"{member_name}'s payout for {scheduled_date.strftime('%d/%m/%Y')} has already been made."
+        return False, f"{possessive} payout for {scheduled_date.strftime('%d/%m/%Y')} has already been made."
 
     if today < scheduled_date:
-        return False, f"{member_name} is not due yet. Scheduled date is {scheduled_date.strftime('%d/%m/%Y')}, today is {today.strftime('%d/%m/%Y')}."
+        verb = "You are" if is_self else f"{member_name} is"
+        return False, f"{verb} not due yet. Scheduled date is {scheduled_date.strftime('%d/%m/%Y')}, today is {today.strftime('%d/%m/%Y')}."
 
-    return True, f"{member_name} is eligible — scheduled date {scheduled_date.strftime('%d/%m/%Y')} has been reached. [SIMULATED] Would send {amount} to their registered phone number."
+    verb_are = "are" if is_self else "is"
+    return True, f"{subject} {verb_are} eligible — scheduled date {scheduled_date.strftime('%d/%m/%Y')} has been reached. [SIMULATED] Would send {amount} to {'your' if is_self else 'their'} registered phone number."
 
 
 def mark_scheduled_payout_made(member_name):
@@ -551,13 +570,24 @@ def mark_scheduled_payout_made(member_name):
     st.session_state.payout_schedule[position] = compute_date_for_offset(new_offset)
 
 
-def check_loan_eligibility(member_name, amount):
+def personalize_subject(name, viewer):
+    """Returns 'you' if name is the same person the message is being delivered to, else their actual name.
+    Prevents Juma from being told 'Juma is eligible...' inside his own account."""
+    return "you" if viewer is not None and name == viewer else name
+
+
+def check_loan_eligibility(member_name, amount, viewer=None):
     member = MOCK_MEMBERS.get(member_name)
+    subject = personalize_subject(member_name, viewer)
+    is_self = subject == "you"
     if not member:
         return False, f"{member_name} is not a registered member."
     if amount > member["loan_eligible"]:
-        return False, f"{member_name} requested {amount}, which exceeds their eligible limit of {member['loan_eligible']}."
-    return True, f"{member_name} is eligible for a loan of {amount}."
+        possessive = "your" if is_self else f"{member_name}'s"
+        verb = "You requested" if is_self else f"{member_name} requested"
+        return False, f"{verb} {amount}, which exceeds {possessive} eligible limit of {member['loan_eligible']}."
+    verb_are = "are" if is_self else "is"
+    return True, f"{subject} {verb_are} eligible for a loan of {amount}."
 
 
 def calculate_loan_estimate(principal, duration_months, interest_rate=LOAN_REQUEST_DEFAULT_INTEREST, fee_rate=LOAN_REQUEST_DEFAULT_FEE):
@@ -894,7 +924,7 @@ if page == "Record & Query":
                         block_loan_request = False
 
                         if edited_speaker_action == "loan_request":
-                            eligible, elig_message = check_loan_eligibility(speaking_as, edited_amount)
+                            eligible, elig_message = check_loan_eligibility(speaking_as, edited_amount, viewer=speaking_as)
                             ai_action_taken = True
                             if not eligible:
                                 block_loan_request = True
@@ -905,7 +935,7 @@ if page == "Record & Query":
                                 confirmation_text = f"Your requested amount of {edited_amount} is within your eligible limit. Let's set up the repayment details below."
 
                         if edited_speaker_action == "initiate_scheduled_payout" and IS_ADMIN and edited_referenced_member not in ("none", ""):
-                            eligible, elig_message = check_scheduled_payout_eligibility(edited_referenced_member, edited_amount)
+                            eligible, elig_message = check_scheduled_payout_eligibility(edited_referenced_member, edited_amount, viewer=speaking_as)
                             ai_action_taken = True
                             if eligible:
                                 mark_scheduled_payout_made(edited_referenced_member)
@@ -926,7 +956,7 @@ if page == "Record & Query":
                                 st.error("❌ Please state the loan duration in months (e.g. 'kwa miezi sita') before approving.")
                                 confirmation_text += " Please state the loan duration in months before approving."
                             else:
-                                eligible, elig_message = check_loan_eligibility(edited_referenced_member, pending_loan["amount"])
+                                eligible, elig_message = check_loan_eligibility(edited_referenced_member, pending_loan["amount"], viewer=speaking_as)
                                 idx = st.session_state.loan_requests.index(pending_loan)
                                 if eligible:
                                     terms = calculate_loan_terms(pending_loan["amount"], spoken_duration)
@@ -1136,7 +1166,7 @@ elif page == "Dashboard":
                         interest_pct = st.number_input("Interest (%)", value=LOAN_REQUEST_DEFAULT_INTEREST*100, min_value=0.0, max_value=100.0, step=0.5, key=f"interest_{idx}")
                         duration = st.number_input("Duration (months)", min_value=2, max_value=6, value=lr.get("suggested_duration_months", 4), key=f"duration_{idx}")
                         if st.button("Confirm approval", key=f"confirm_approve_{idx}"):
-                            eligible, elig_message = check_loan_eligibility(lr["member"], lr["amount"])
+                            eligible, elig_message = check_loan_eligibility(lr["member"], lr["amount"], viewer=CURRENT_USER)
                             if eligible:
                                 terms = calculate_loan_terms(lr["amount"], duration, interest_rate=interest_pct/100, processing_fee_rate=fee_pct/100)
                                 st.session_state.loan_requests[idx]["status"] = "approved"

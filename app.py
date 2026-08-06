@@ -27,6 +27,8 @@ VALID_SPEAKER_ACTIONS = {"deposit", "payout_received", "initiate_scheduled_payou
 ADMIN_ALLOWED_ACTIONS = VALID_SPEAKER_ACTIONS
 MEMBER_ALLOWED_ACTIONS = {"deposit", "payout_received", "late_payment_note", "loan_request", "other"}
 
+WEEKDAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+
 USERS = {
     "Wendo": {"role": "admin"},
     "Juma": {"role": "member"},
@@ -65,10 +67,14 @@ SCHEDULE_START_MONTH = 8
 REAL_TODAY = date.today()
 CURRENT_MONTH_INDEX = REAL_TODAY.month
 
-BENCHMARK_SAMPLE_START_INDEX = 4  # continues from testcase1-3 already used in the notebook
+BENCHMARK_SAMPLE_START_INDEX = 4
 
 PENALTY_RATE_PER_MONTH_LATE = 0.05  # assumption: 5% of that month's installment, per month overdue — not specified in requirements
 
+
+# ============================================================
+# Date / schedule helpers
+# ============================================================
 
 def get_member_by_position(position):
     for name, data in MOCK_MEMBERS.items():
@@ -92,11 +98,25 @@ def build_initial_schedule():
     return schedule
 
 
-def get_next_friday(from_date):
-    days_ahead = 4 - from_date.weekday()
-    if days_ahead <= 0:
+def get_next_weekday_on_or_after(from_date, weekday_name, strictly_after=True):
+    """Returns the next occurrence of weekday_name after from_date (or on it, if strictly_after=False)."""
+    if weekday_name not in WEEKDAY_NAMES:
+        return None
+    target = WEEKDAY_NAMES.index(weekday_name)
+    days_ahead = target - from_date.weekday()
+    if days_ahead < 0 or (days_ahead == 0 and strictly_after):
         days_ahead += 7
     return from_date + timedelta(days=days_ahead)
+
+
+def get_next_friday(from_date):
+    return get_next_weekday_on_or_after(from_date, "Friday")
+
+
+def get_first_of_next_month(from_date):
+    if from_date.month == 12:
+        return date(from_date.year + 1, 1, 1)
+    return date(from_date.year, from_date.month + 1, 1)
 
 
 if "payout_schedule" not in st.session_state:
@@ -118,6 +138,10 @@ def get_pending_loan_for_member(member_name):
     return None
 
 
+# ============================================================
+# Sahara STT / TTS
+# ============================================================
+
 def transcribe_sahara(audio_path, language="sw"):
     url = "https://infer.voice.intron.io/file/v1/upload/sync"
     headers = {"Authorization": f"Bearer {SAHARA_API_KEY}"}
@@ -132,6 +156,18 @@ def transcribe_sahara(audio_path, language="sw"):
         raise Exception(f"Sahara returned non-JSON response: {response.text[:300]}")
 
 
+def generate_tts(text, voice_accent="swahili", voice_gender="female", voice_language="en"):
+    url = "https://infer.voice.intron.io/tts/v1/generate"
+    headers = {"Authorization": f"Bearer {SAHARA_API_KEY}", "Content-Type": "application/json"}
+    payload = {"text": text, "voice_accent": voice_accent, "voice_gender": voice_gender, "voice_language": voice_language}
+    response = requests.post(url, headers=headers, json=payload, timeout=60)
+    return response.json()["data"]["audio_path"]
+
+
+# ============================================================
+# Groq: intent, terminology-aware Q&A, extraction, commitment-date parsing
+# ============================================================
+
 def classify_intent(transcript):
     prompt = f"""Classify this chama voice message as either "statement" or "question".
 
@@ -140,8 +176,9 @@ def classify_intent(transcript):
 payout for another member, or any message where the speaker wants an action taken or recorded —
 even if phrased politely as a request.
 
-"question" is ONLY for messages purely seeking information with no action requested
-(e.g. "When is my turn?", "How much do I owe?", "Nimechangia kiasi gani?").
+"question" includes: purely seeking information with no action requested about their own account
+(e.g. "When is my turn?", "How much do I owe?"), AND general questions asking what a term or concept
+means (e.g. "Interest ni nini?", "What is a processing fee?", "How does the payout rotation work?").
 
 Transcript: "{transcript}"
 
@@ -156,14 +193,23 @@ Respond with ONLY one word: "statement" or "question"."""
 
 def answer_member_query(transcript, member_name):
     member_record = MOCK_MEMBERS.get(member_name, {})
-    prompt = f"""You are a chama assistant. Answer the member's question using ONLY the data provided below.
-Do not invent numbers not present in the data. This is illustrative demo data.
+    prompt = f"""You are a friendly chama (savings group) assistant, speaking to someone who may not be
+familiar with financial or chama terminology. The message may be in English, Swahili, or a mix.
 
-Member data for {member_name}: {json.dumps(member_record)}
+There are two kinds of questions you might be asked:
+1. Questions about THEIR OWN account (balance, when they last paid, when their turn is, loan eligibility).
+   Answer using ONLY the data provided below. Do not invent numbers not present in the data.
+2. Questions asking what a TERM or CONCEPT means (e.g. "what is interest", "what is a processing fee",
+   "how does the payout rotation work", "what is a chama"). Answer these in plain, simple language,
+   as if explaining to someone running their first chama — avoid jargon, use short sentences, and where
+   helpful, briefly relate the term to their own situation using the data below.
+
+Member data for {member_name} (illustrative demo data): {json.dumps(member_record)}
 
 Question: "{transcript}"
 
-Give a short, direct spoken-style answer (1-2 sentences)."""
+Give a short, direct, spoken-style answer (1-3 sentences). If it's a terminology question, prioritize
+clarity over completeness."""
     response = groq_client.chat.completions.create(
         model="llama-3.1-8b-instant",
         messages=[{"role": "user", "content": prompt}],
@@ -193,7 +239,7 @@ CRITICAL RULES:
 - Only extract information explicitly stated. Do NOT infer or guess missing values.
 - If no amount is mentioned, amount must be null — never 0, never invented, never a small placeholder number.
 - Amounts may be stated as digits (e.g. "2000") or as words (e.g. "elfu mbili" / "two thousand"). Both are valid.
-- If the speaker uses future tense (e.g. "nitatuma" / "I will send") without saying they already paid, this is NOT a completed deposit.
+- If the speaker uses future tense (e.g. "nitatuma" / "I will send" / "nitalipa" / "I will pay") without saying they already paid, this is NOT a completed deposit — it is "late_payment_note".
 - Vague quantity words (e.g. "kidogo" / "a little" / "some") are NOT numbers. Never convert them into a numeric guess.
 - referenced_member must be an actual person's name, never a number or group description, and never {speaker_name} unless {speaker_name} refers to themselves. If none, use "none".
 - If the speaker is COMMANDING a regular scheduled payout be sent to a member (e.g. "Tuma X kwa Y"), this is "initiate_scheduled_payout".
@@ -218,12 +264,12 @@ Transcript: "Naomba mkopo wa elfu tano."
 Correct extraction: {{"reasoning": "Speaker is requesting to borrow money for themselves from the group. No other member named.", "speaker_action": "loan_request", "amount": 5000, "referenced_member": "none", "referenced_member_context": "none", "action_type": "other", "loan_duration_months": null}}
 
 Example 5:
-Transcript: "Approve mkopo wa Juma."
-Correct extraction: {{"reasoning": "Speaker is approving and releasing an existing loan payout for another member, Juma — the speaker is the admin taking the action, Juma is who it's about, not the speaker. No duration mentioned.", "speaker_action": "initiate_loan_payout", "amount": null, "referenced_member": "Juma", "referenced_member_context": "loan payout approval", "action_type": "payout", "loan_duration_months": null}}
-
-Example 6:
 Transcript: "Approve mkopo wa Juma kwa miezi sita."
 Correct extraction: {{"reasoning": "Admin is approving Juma's loan and specifying a 6-month repayment duration.", "speaker_action": "initiate_loan_payout", "amount": null, "referenced_member": "Juma", "referenced_member_context": "loan payout approval", "action_type": "payout", "loan_duration_months": 6}}
+
+Example 6:
+Transcript: "Nitalipa Ijumaa ijayo."
+Correct extraction: {{"reasoning": "Speaker commits to a future payment ('nitalipa' = I will pay). No amount stated.", "speaker_action": "late_payment_note", "amount": null, "referenced_member": "none", "referenced_member_context": "none", "action_type": "late_payment_note", "loan_duration_months": null}}
 
 Now extract from this transcript, spoken by {speaker_name}:
 Transcript: "{transcript}"
@@ -265,6 +311,73 @@ def validate_extraction(transcript, extracted):
     extracted.pop("reasoning", None)
     return extracted
 
+
+def parse_commitment_date_reference(transcript):
+    """Uses the LLM only to classify WHICH kind of date reference was spoken.
+    All actual date arithmetic happens in Python (resolve_commitment_date), not the LLM,
+    since language models are unreliable at date math."""
+    prompt = f"""A chama member said the following, committing to pay at some future point.
+Identify what kind of date reference they used.
+
+Transcript: "{transcript}"
+
+Respond with ONLY valid JSON in this exact structure:
+{{"reference_type": "...", "weekday": "...", "days_ahead": ..., "explicit_day": ..., "explicit_month": ...}}
+
+Where reference_type is exactly one of:
+- "weekday" (e.g. "next Friday", "Ijumaa ijayo", "Jumatatu") — set "weekday" to the English weekday name (Monday..Sunday)
+- "tomorrow" (e.g. "kesho")
+- "day_after_tomorrow" (e.g. "keshokutwa")
+- "next_week" (e.g. "wiki ijayo", generic, no specific day named)
+- "next_month" (e.g. "mwezi ujao", "next month")
+- "in_days" (e.g. "in three days") — set "days_ahead" to the integer number of days
+- "explicit_date" (a specific calendar date was stated) — set "explicit_day" (1-31) and "explicit_month" (1-12)
+- "unclear" (no usable date reference found)
+
+Set fields that don't apply to null. Respond with ONLY the JSON, no other text."""
+    response = groq_client.chat.completions.create(
+        model="llama-3.1-8b-instant",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0,
+        response_format={"type": "json_object"}
+    )
+    return json.loads(response.choices[0].message.content)
+
+
+def resolve_commitment_date(reference, today):
+    """Pure Python date arithmetic based on the LLM's classification. Returns a date or None if unresolved."""
+    ref_type = reference.get("reference_type")
+    try:
+        if ref_type == "weekday":
+            return get_next_weekday_on_or_after(today, reference.get("weekday"))
+        elif ref_type == "tomorrow":
+            return today + timedelta(days=1)
+        elif ref_type == "day_after_tomorrow":
+            return today + timedelta(days=2)
+        elif ref_type == "next_week":
+            return today + timedelta(days=7)
+        elif ref_type == "next_month":
+            return get_first_of_next_month(today)
+        elif ref_type == "in_days":
+            days = reference.get("days_ahead")
+            return today + timedelta(days=int(days)) if days else None
+        elif ref_type == "explicit_date":
+            day = reference.get("explicit_day")
+            month = reference.get("explicit_month")
+            if day and month:
+                year = today.year
+                candidate = date(year, int(month), int(day))
+                if candidate < today:
+                    candidate = date(year + 1, int(month), int(day))
+                return candidate
+    except (ValueError, TypeError):
+        return None
+    return None
+
+
+# ============================================================
+# Payout / loan business logic
+# ============================================================
 
 def check_scheduled_payout_eligibility(member_name, amount):
     member = MOCK_MEMBERS.get(member_name)
@@ -349,14 +462,6 @@ def update_schedule_penalties(loan_request):
     return loan_request
 
 
-def generate_tts(text, voice_accent="swahili", voice_gender="female", voice_language="en"):
-    url = "https://infer.voice.intron.io/tts/v1/generate"
-    headers = {"Authorization": f"Bearer {SAHARA_API_KEY}", "Content-Type": "application/json"}
-    payload = {"text": text, "voice_accent": voice_accent, "voice_gender": voice_gender, "voice_language": voice_language}
-    response = requests.post(url, headers=headers, json=payload, timeout=60)
-    return response.json()["data"]["audio_path"]
-
-
 def generate_confirmation_text(entry):
     if entry["speaker_action"] == "deposit":
         text = f"Confirmed: deposit of {entry['amount']} logged."
@@ -369,7 +474,7 @@ def generate_confirmation_text(entry):
     elif entry["speaker_action"] == "loan_request":
         text = f"Your loan request for {entry['amount']} is ready. Please confirm below to submit it for admin approval."
     elif entry["speaker_action"] == "late_payment_note":
-        text = "Noted: you'll be sending your payment late. No amount logged yet."
+        text = "Noted: you'll be sending your payment late."
     elif entry["speaker_action"] == "membership_update":
         text = "Group update noted."
     else:
@@ -377,7 +482,78 @@ def generate_confirmation_text(entry):
     return text
 
 
+# ============================================================
+# Page config + visual polish
+# ============================================================
+
 st.set_page_config(page_title="Habahub", page_icon="🎙️", layout="wide")
+
+st.markdown("""
+<style>
+    @import url('https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700&display=swap');
+
+    html, body, [class*="css"] {
+        font-family: 'Poppins', sans-serif;
+    }
+
+    :root {
+        --habahub-primary: #1F7A5C;
+        --habahub-accent: #E8A33D;
+        --habahub-bg: #FAF7F2;
+    }
+
+    .stApp {
+        background-color: var(--habahub-bg);
+    }
+
+    section[data-testid="stSidebar"] {
+        background-color: #14503A;
+    }
+    section[data-testid="stSidebar"] * {
+        color: #F5F0E6 !important;
+    }
+    section[data-testid="stSidebar"] .stRadio label {
+        font-weight: 500;
+    }
+
+    [data-testid="stMetric"] {
+        background-color: white;
+        border-radius: 12px;
+        padding: 14px 16px;
+        border: 1px solid #EAE3D6;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+    }
+    [data-testid="stMetricLabel"] {
+        color: #6B6154;
+    }
+    [data-testid="stMetricValue"] {
+        color: var(--habahub-primary);
+    }
+
+    h1, h2, h3 {
+        color: #22332C;
+    }
+
+    .stButton>button {
+        border-radius: 8px;
+        font-weight: 500;
+    }
+    .stButton>button[kind="primary"] {
+        background-color: var(--habahub-primary);
+        border: none;
+    }
+
+    div[data-testid="stExpander"] {
+        border-radius: 10px;
+        border: 1px solid #EAE3D6;
+        background-color: white;
+    }
+
+    hr {
+        border-color: #EAE3D6;
+    }
+</style>
+""", unsafe_allow_html=True)
 
 if "ledger" not in st.session_state:
     st.session_state.ledger = []
@@ -417,7 +593,7 @@ speaking_as = CURRENT_USER
 if page == "Record & Query":
     render_header("Record & Query")
     st.caption(f"Logged in as: {speaking_as}")
-    st.write("Speak a contribution, payment note, loan request, or update — or ask a question about your account — in English, Swahili, or both.")
+    st.write("Speak a contribution, payment note, loan request, or update — or ask about your account or what a term means — in English, Swahili, or both.")
     audio = st.audio_input("Record your message")
 
     if audio is not None:
@@ -566,9 +742,14 @@ if page == "Record & Query":
                         }
 
                     if edited_speaker_action == "late_payment_note":
+                        with st.spinner("Working out the date you mentioned..."):
+                            ref = parse_commitment_date_reference(transcript)
+                            resolved_date = resolve_commitment_date(ref, st.session_state.simulated_today)
                         st.session_state.show_reminder_offer = True
                         st.session_state.reminder_offer_member = speaking_as
                         st.session_state.reminder_offer_amount = final_entry.get("amount")
+                        st.session_state.reminder_offer_date = resolved_date
+                        st.session_state.reminder_offer_date_was_parsed = resolved_date is not None
 
                     with st.spinner("Generating spoken confirmation..."):
                         audio_url = generate_tts(confirmation_text)
@@ -596,9 +777,18 @@ if page == "Record & Query":
 
             if st.session_state.get("show_reminder_offer"):
                 st.divider()
-                next_friday = get_next_friday(st.session_state.simulated_today)
                 st.subheader("📅 Schedule a payment reminder?")
-                st.write(f"Would you like a reminder SMS scheduled for **next Friday, {next_friday.strftime('%d/%m/%Y')} at 9:00 AM**?")
+
+                resolved_date = st.session_state.get("reminder_offer_date")
+                was_parsed = st.session_state.get("reminder_offer_date_was_parsed")
+
+                if was_parsed:
+                    st.write(f"Based on what you said, you're planning to pay on **{resolved_date.strftime('%A, %d/%m/%Y')}**. We can send a reminder that morning at 9:00 AM.")
+                else:
+                    st.info("We couldn't work out the exact date you meant — please pick one below.")
+                    resolved_date = resolved_date or get_next_friday(st.session_state.simulated_today)
+
+                reminder_date = st.date_input("Reminder date", value=resolved_date, min_value=st.session_state.simulated_today, key="reminder_date_input")
 
                 existing_amount = st.session_state.reminder_offer_amount
                 if existing_amount is None:
@@ -619,11 +809,11 @@ if page == "Record & Query":
                             "member": st.session_state.reminder_offer_member,
                             "amount": reminder_amount,
                             "category": reminder_category,
-                            "date": next_friday.strftime("%d/%m/%Y"),
+                            "date": reminder_date.strftime("%d/%m/%Y"),
                             "time": "09:00",
                             "status": "scheduled"
                         })
-                        st.success(f"✅ SIMULATED — {reminder_category} reminder of {reminder_amount} scheduled for {st.session_state.reminder_offer_member} on {next_friday.strftime('%d/%m/%Y')} at 9:00 AM. No real SMS sent.")
+                        st.success(f"✅ SIMULATED — {reminder_category} reminder of {reminder_amount} scheduled for {st.session_state.reminder_offer_member} on {reminder_date.strftime('%d/%m/%Y')} at 9:00 AM. No real SMS sent.")
                         st.session_state.show_reminder_offer = False
                         st.rerun()
                 if st.button("No thanks"):
@@ -665,7 +855,7 @@ elif page == "Dashboard":
         collected_to_show = MOCK_MONTHLY_TOTALS["Collected"].tolist()[:CURRENT_MONTH_INDEX]
         monthly_df = pd.DataFrame({"Month": months_to_show, "Collected": collected_to_show})
         monthly_df["Month"] = pd.Categorical(monthly_df["Month"], categories=months_to_show, ordered=True)
-        st.bar_chart(monthly_df.set_index("Month"))
+        st.bar_chart(monthly_df.set_index("Month"), color="#1F7A5C")
 
         st.subheader("Member contributions")
         member_df = pd.DataFrame([
@@ -777,7 +967,7 @@ elif page == "Dashboard":
         my_monthly_values = MOCK_MEMBER_MONTHLY.get(CURRENT_USER, [0]*12)[:CURRENT_MONTH_INDEX]
         my_monthly_df = pd.DataFrame({"Month": months_to_show, "Contributed": my_monthly_values})
         my_monthly_df["Month"] = pd.Categorical(my_monthly_df["Month"], categories=months_to_show, ordered=True)
-        st.bar_chart(my_monthly_df.set_index("Month"))
+        st.bar_chart(my_monthly_df.set_index("Month"), color="#E8A33D")
 
         st.subheader("Your loan requests")
         my_loans = [lr for lr in st.session_state.loan_requests if lr["member"] == CURRENT_USER]
@@ -794,6 +984,13 @@ elif page == "Dashboard":
                     )
                     st.dataframe(pd.DataFrame(lr["schedule"]), use_container_width=True, hide_index=True)
                 st.divider()
+
+        st.subheader("Your scheduled reminders")
+        my_reminders = [r for r in st.session_state.scheduled_reminders if r["member"] == CURRENT_USER]
+        if not my_reminders:
+            st.info("No reminders scheduled yet.")
+        else:
+            st.dataframe(pd.DataFrame(my_reminders), use_container_width=True, hide_index=True)
 
 # ============================================================
 # PAGE 3: Benchmark Data

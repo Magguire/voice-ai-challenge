@@ -69,7 +69,10 @@ CURRENT_MONTH_INDEX = REAL_TODAY.month
 
 BENCHMARK_SAMPLE_START_INDEX = 4
 
-PENALTY_RATE_PER_MONTH_LATE = 0.05  # assumption: 5% of that month's installment, per month overdue — not specified in requirements
+# --- Unified loan economics: 8% interest, 3% processing fee, 2% penalty per month late ---
+LOAN_REQUEST_DEFAULT_INTEREST = 0.08
+LOAN_REQUEST_DEFAULT_FEE = 0.03
+PENALTY_RATE_PER_MONTH_LATE = 0.02
 
 
 # ============================================================
@@ -99,7 +102,6 @@ def build_initial_schedule():
 
 
 def get_next_weekday_on_or_after(from_date, weekday_name, strictly_after=True):
-    """Returns the next occurrence of weekday_name after from_date (or on it, if strictly_after=False)."""
     if weekday_name not in WEEKDAY_NAMES:
         return None
     target = WEEKDAY_NAMES.index(weekday_name)
@@ -165,7 +167,7 @@ def generate_tts(text, voice_accent="swahili", voice_gender="female", voice_lang
 
 
 # ============================================================
-# Groq: intent, terminology-aware Q&A, extraction, commitment-date parsing
+# Groq: intent, query routing, extraction, commitment-date parsing
 # ============================================================
 
 def classify_intent(transcript):
@@ -176,13 +178,31 @@ def classify_intent(transcript):
 payout for another member, or any message where the speaker wants an action taken or recorded —
 even if phrased politely as a request.
 
-"question" includes: purely seeking information with no action requested about their own account
-(e.g. "When is my turn?", "How much do I owe?"), AND general questions asking what a term or concept
-means (e.g. "Interest ni nini?", "What is a processing fee?", "How does the payout rotation work?").
+"question" includes: purely seeking information with no action requested about their own account,
+about the payout rotation, group statistics, or definitions of terms.
 
 Transcript: "{transcript}"
 
 Respond with ONLY one word: "statement" or "question"."""
+    response = groq_client.chat.completions.create(
+        model="llama-3.1-8b-instant",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0
+    )
+    return response.choices[0].message.content.strip().lower()
+
+
+def classify_query_category(transcript):
+    prompt = f"""Classify this chama question into exactly one category:
+- "own_account": about the speaker's own balance, payments, loan eligibility, or their own payout position
+- "payout_rotation": asking who is next to receive the scheduled monthly payout, or when
+- "admin_aggregate": asking about OTHER members' data, group-wide totals, loan statistics/counts, who has/hasn't paid, or any bookkeeping question not about the speaker themselves
+- "definition": asking what a term or concept means (e.g. "what is interest")
+- "other": anything else
+
+Transcript: "{transcript}"
+
+Respond with ONLY one word: own_account, payout_rotation, admin_aggregate, definition, or other."""
     response = groq_client.chat.completions.create(
         model="llama-3.1-8b-instant",
         messages=[{"role": "user", "content": prompt}],
@@ -201,21 +221,95 @@ There are two kinds of questions you might be asked:
    Answer using ONLY the data provided below. Do not invent numbers not present in the data.
 2. Questions asking what a TERM or CONCEPT means (e.g. "what is interest", "what is a processing fee",
    "how does the payout rotation work", "what is a chama"). Answer these in plain, simple language,
-   as if explaining to someone running their first chama — avoid jargon, use short sentences, and where
-   helpful, briefly relate the term to their own situation using the data below.
+   as if explaining to someone running their first chama — avoid jargon, use short sentences.
 
 Member data for {member_name} (illustrative demo data): {json.dumps(member_record)}
 
 Question: "{transcript}"
 
-Give a short, direct, spoken-style answer (1-3 sentences). If it's a terminology question, prioritize
-clarity over completeness."""
+Give a short, direct, spoken-style answer (1-3 sentences)."""
     response = groq_client.chat.completions.create(
         model="llama-3.1-8b-instant",
         messages=[{"role": "user", "content": prompt}],
         temperature=0
     )
     return response.choices[0].message.content
+
+
+def answer_payout_rotation_query(member_name, is_admin):
+    """Members get only position numbers (no names). Admins get the recipient's name and their own date too."""
+    positions_sorted = sorted(MOCK_MEMBERS.items(), key=lambda x: x[1]["payout_position"])
+    next_position, next_name = None, None
+    for name, data in positions_sorted:
+        pos = data["payout_position"]
+        if pos not in st.session_state.payouts_made_positions:
+            next_position, next_name = pos, name
+            break
+
+    my_position = MOCK_MEMBERS.get(member_name, {}).get("payout_position")
+
+    if is_admin:
+        next_date = st.session_state.payout_schedule.get(next_position)
+        my_date = st.session_state.payout_schedule.get(my_position)
+        return (
+            f"Position {next_position} is next — that's {next_name}, scheduled for "
+            f"{next_date.strftime('%d/%m/%Y') if next_date else 'an unset date'}. "
+            f"Your own payout (position {my_position}) is scheduled for "
+            f"{my_date.strftime('%d/%m/%Y') if my_date else 'an unset date'}."
+        )
+    else:
+        return f"Position {next_position} is next in line to receive the payout. You are position {my_position}."
+
+
+def answer_admin_aggregate_query(transcript):
+    """Answers bookkeeping-style questions from real session data, filtered as requested. Admin-only — never called for members."""
+    approved = [lr for lr in st.session_state.loan_requests if lr["status"] == "approved"]
+    this_month_start = date(st.session_state.simulated_today.year, st.session_state.simulated_today.month, 1)
+
+    this_month_loans = []
+    for lr in approved:
+        approval_date_str = lr.get("approval_date")
+        if not approval_date_str:
+            continue
+        try:
+            approval_dt = pd.to_datetime(approval_date_str, format="%d/%m/%Y").date()
+        except (ValueError, TypeError):
+            continue
+        if approval_dt >= this_month_start:
+            this_month_loans.append(lr)
+
+    total_this_month = sum(lr["amount"] for lr in this_month_loans)
+
+    summary_data = {
+        "loans_approved_this_month_count": len(this_month_loans),
+        "loans_approved_this_month_total": total_this_month,
+        "total_pending_loan_requests": len([lr for lr in st.session_state.loan_requests if lr["status"] == "pending"]),
+        "total_rejected_loan_requests": len([lr for lr in st.session_state.loan_requests if lr["status"] == "rejected"]),
+        "members_not_paid_this_month": [n for n, d in MOCK_MEMBERS.items() if not d["this_month_paid"]],
+        "total_owed_group_wide": sum(d["owed"] for d in MOCK_MEMBERS.values()),
+    }
+
+    prompt = f"""You are a chama admin assistant with full bookkeeping access. Answer using ONLY this data — do not invent numbers.
+
+Data: {json.dumps(summary_data)}
+
+Question: "{transcript}"
+
+Give a short, direct spoken-style answer (1-2 sentences)."""
+    response = groq_client.chat.completions.create(
+        model="llama-3.1-8b-instant",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0
+    )
+
+    table = [{"Member": lr["member"], "Amount": lr["amount"], "Approved": lr.get("approval_date", "N/A")} for lr in this_month_loans]
+    return response.choices[0].message.content, table
+
+
+def answer_restricted_query(member_name):
+    """Fallback for members asking admin-only aggregate questions — states the restriction, then offers what they CAN know."""
+    my_eligible = MOCK_MEMBERS.get(member_name, {}).get("loan_eligible", 0)
+    return f"That information isn't available to members — it's for group administrators only. What I can tell you: you're eligible for a loan of up to {my_eligible}."
 
 
 def extract_chama_action(transcript, speaker_name):
@@ -313,9 +407,7 @@ def validate_extraction(transcript, extracted):
 
 
 def parse_commitment_date_reference(transcript):
-    """Uses the LLM only to classify WHICH kind of date reference was spoken.
-    All actual date arithmetic happens in Python (resolve_commitment_date), not the LLM,
-    since language models are unreliable at date math."""
+    """LLM classifies WHICH kind of date reference was spoken; Python does all actual date arithmetic."""
     prompt = f"""A chama member said the following, committing to pay at some future point.
 Identify what kind of date reference they used.
 
@@ -345,7 +437,6 @@ Set fields that don't apply to null. Respond with ONLY the JSON, no other text."
 
 
 def resolve_commitment_date(reference, today):
-    """Pure Python date arithmetic based on the LLM's classification. Returns a date or None if unresolved."""
     ref_type = reference.get("reference_type")
     try:
         if ref_type == "weekday":
@@ -416,8 +507,18 @@ def check_loan_eligibility(member_name, amount):
     return True, f"{member_name} is eligible for a loan of {amount}. [SIMULATED] Would send funds to their registered phone number."
 
 
-def calculate_loan_terms(principal, duration_months, interest_rate=0.08, processing_fee_rate=0.03, approval_date=None):
-    """Flat (non-compounding) interest, calculated once on principal. Simplification, disclosed as such."""
+def calculate_loan_estimate(principal, duration_months, interest_rate=LOAN_REQUEST_DEFAULT_INTEREST, fee_rate=LOAN_REQUEST_DEFAULT_FEE):
+    """Quick estimate shown to a member at request time — same formula as calculate_loan_terms, without building a full schedule yet."""
+    interest = round(principal * interest_rate, 2)
+    fee = round(principal * fee_rate, 2)
+    total = round(principal + interest + fee, 2)
+    monthly = round(total / duration_months, 2) if duration_months else None
+    return {"interest": interest, "fee": fee, "total": total, "monthly": monthly}
+
+
+def calculate_loan_terms(principal, duration_months, interest_rate=LOAN_REQUEST_DEFAULT_INTEREST, processing_fee_rate=LOAN_REQUEST_DEFAULT_FEE, approval_date=None):
+    """Flat (non-compounding) interest, calculated once on principal. Simplification, disclosed as such.
+    Builds the full month-by-month repayment schedule at admin approval time."""
     if approval_date is None:
         approval_date = st.session_state.simulated_today
     interest_amount = round(principal * interest_rate, 2)
@@ -450,7 +551,7 @@ def calculate_loan_terms(principal, duration_months, interest_rate=0.08, process
 
 
 def update_schedule_penalties(loan_request):
-    """Marks overdue installments and computes accrued penalty. Does not yet handle marking installments as paid."""
+    """Marks overdue installments and computes accrued penalty at 2%/month late. Does not yet mark installments as paid."""
     if "schedule" not in loan_request:
         return loan_request
     today = st.session_state.simulated_today
@@ -472,7 +573,7 @@ def generate_confirmation_text(entry):
     elif entry["speaker_action"] == "initiate_loan_payout":
         text = f"Checking loan payout for {entry['referenced_member']}."
     elif entry["speaker_action"] == "loan_request":
-        text = f"Your loan request for {entry['amount']} is ready. Please confirm below to submit it for admin approval."
+        text = f"Your loan request for {entry['amount']} is ready. Please review the estimate below and confirm to submit it for admin approval."
     elif entry["speaker_action"] == "late_payment_note":
         text = "Noted: you'll be sending your payment late."
     elif entry["speaker_action"] == "membership_update":
@@ -486,7 +587,7 @@ def generate_confirmation_text(entry):
 # Page config + visual polish
 # ============================================================
 
-st.set_page_config(page_title="HabaHub", page_icon="🎙️", layout="wide")
+st.set_page_config(page_title="Habahub", page_icon="🎙️", layout="wide")
 
 st.markdown("""
 <style>
@@ -564,7 +665,7 @@ if "loan_requests" not in st.session_state:
 if "pending_loan_review" not in st.session_state:
     st.session_state.pending_loan_review = None
 
-st.sidebar.title("🎙️ HabaHub")
+st.sidebar.title("🎙️ Habahub")
 st.sidebar.markdown(f"**{CURRENT_USER}** ({'Admin' if IS_ADMIN else 'Member'})")
 st.sidebar.divider()
 page = st.sidebar.radio("Navigate", ["Dashboard", "Record & Query", "Benchmark Data"])
@@ -593,7 +694,7 @@ speaking_as = CURRENT_USER
 if page == "Record & Query":
     render_header("Record & Query")
     st.caption(f"Logged in as: {speaking_as}")
-    st.write("Speak a contribution, payment note, loan request, or update — or ask about your account or what a term means — in English, Swahili, or both.")
+    st.write("Speak a contribution, payment note, loan request, or update — or ask about your account, the payout rotation, or what a term means — in English, Swahili, or both.")
     audio = st.audio_input("Record your message")
 
     if audio is not None:
@@ -639,8 +740,20 @@ if page == "Record & Query":
 
         if intent == "question":
             with st.spinner("Checking records..."):
-                answer = answer_member_query(transcript, speaking_as)
+                category = classify_query_category(transcript)
+                loan_table = None
+                if category == "payout_rotation":
+                    answer = answer_payout_rotation_query(speaking_as, IS_ADMIN)
+                elif category == "admin_aggregate":
+                    if IS_ADMIN:
+                        answer, loan_table = answer_admin_aggregate_query(transcript)
+                    else:
+                        answer = answer_restricted_query(speaking_as)
+                else:
+                    answer = answer_member_query(transcript, speaking_as)
             st.write("**Answer:**", answer)
+            if loan_table:
+                st.dataframe(pd.DataFrame(loan_table), use_container_width=True, hide_index=True)
             with st.spinner("Generating spoken answer..."):
                 audio_url = generate_tts(answer)
             st.audio(audio_url)
@@ -760,12 +873,23 @@ if page == "Record & Query":
                 st.divider()
                 st.subheader("Confirm loan request")
                 lr = st.session_state.pending_loan_review
-                st.write(f"Requesting **{lr['amount']}** on behalf of **{lr['member']}**.")
+                suggested_duration = st.number_input(
+                    "Suggested repayment period (months)", min_value=2, max_value=6, value=4, key="loan_req_duration"
+                )
+                estimate = calculate_loan_estimate(lr["amount"], suggested_duration)
+                st.write(
+                    f"Requesting **{lr['amount']}** on behalf of **{lr['member']}**. "
+                    f"Estimated monthly payment: **{estimate['monthly']}** "
+                    f"(interest {LOAN_REQUEST_DEFAULT_INTEREST*100:.0f}%, fee {LOAN_REQUEST_DEFAULT_FEE*100:.0f}%, "
+                    f"over {suggested_duration} months)."
+                )
+                st.caption(f"⚠️ A {PENALTY_RATE_PER_MONTH_LATE*100:.0f}% penalty applies to any payment made late.")
                 col1, col2 = st.columns(2)
                 if col1.button("Submit to admin for approval"):
                     st.session_state.loan_requests.append({
                         "member": lr["member"],
                         "amount": lr["amount"],
+                        "suggested_duration_months": suggested_duration,
                         "status": "pending"
                     })
                     st.success("✅ Loan request submitted to admin for approval.")
@@ -885,9 +1009,10 @@ elif page == "Dashboard":
                         continue
                     st.write(f"**{lr['member']}** requests **{lr['amount']}**")
                     with st.expander(f"Set terms and approve — {lr['member']}"):
-                        fee_pct = st.number_input("Processing fee (%)", value=3.0, min_value=0.0, max_value=100.0, step=0.5, key=f"fee_{idx}")
-                        interest_pct = st.number_input("Interest (%)", value=8.0, min_value=0.0, max_value=100.0, step=0.5, key=f"interest_{idx}")
-                        duration = st.number_input("Duration (months)", min_value=1, max_value=36, value=6, key=f"duration_{idx}")
+                        st.caption(f"Member suggested: {lr.get('suggested_duration_months', 4)} months")
+                        fee_pct = st.number_input("Processing fee (%)", value=LOAN_REQUEST_DEFAULT_FEE*100, min_value=0.0, max_value=100.0, step=0.5, key=f"fee_{idx}")
+                        interest_pct = st.number_input("Interest (%)", value=LOAN_REQUEST_DEFAULT_INTEREST*100, min_value=0.0, max_value=100.0, step=0.5, key=f"interest_{idx}")
+                        duration = st.number_input("Duration (months)", min_value=2, max_value=6, value=lr.get("suggested_duration_months", 4), key=f"duration_{idx}")
                         if st.button("Confirm approval", key=f"confirm_approve_{idx}"):
                             eligible, elig_message = check_loan_eligibility(lr["member"], lr["amount"])
                             if eligible:

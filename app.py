@@ -486,7 +486,7 @@ def generate_confirmation_text(entry):
 # Page config + visual polish
 # ============================================================
 
-st.set_page_config(page_title="Habahub", page_icon="🎙️", layout="wide")
+st.set_page_config(page_title="HabaHub", page_icon="🎙️", layout="wide")
 
 st.markdown("""
 <style>
@@ -564,7 +564,7 @@ if "loan_requests" not in st.session_state:
 if "pending_loan_review" not in st.session_state:
     st.session_state.pending_loan_review = None
 
-st.sidebar.title("🎙️ Habahub")
+st.sidebar.title("🎙️ HabaHub")
 st.sidebar.markdown(f"**{CURRENT_USER}** ({'Admin' if IS_ADMIN else 'Member'})")
 st.sidebar.divider()
 page = st.sidebar.radio("Navigate", ["Dashboard", "Record & Query", "Benchmark Data"])

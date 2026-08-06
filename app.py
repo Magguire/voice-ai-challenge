@@ -184,6 +184,16 @@ def clean_agent_text(text):
     return text
 
 
+def text_for_tts(text):
+    """Sahara's TTS reads a sentence-ending period aloud as the word for the punctuation mark rather than
+    treating it as a silent pause. clean_agent_text() keeps those periods for on-screen/chat readability,
+    so this strips them too, specifically for whatever is actually sent to generate_tts(). Decimal points
+    inside numbers are preserved, since those need to stay for the amount to be spoken correctly."""
+    if not text:
+        return text
+    return re.sub(r'(?<!\d)[.](?!\d)', '', text)
+
+
 def is_transcript_understandable(transcript):
     """Checks whether the transcript is coherent English/Swahili speech that could reasonably be a real
     request or question, versus garbled/nonsensical audio (noise, a cough, a bad transcription) that
@@ -958,12 +968,22 @@ if page == "Overview":
 
     with st.expander("6. What makes this agentic, not just transcription?"):
         st.write(
-            "Bongo takes real downstream action rather than only converting speech to text. It checks "
-            "loan eligibility against a member's actual limit before allowing a request to proceed, "
-            "calculates interest, fees, and penalties, verifies whether a scheduled payout is actually "
-            "due before releasing it, schedules payment reminders it derives from what was said, and "
-            "flags suspicious identity claims for admin review, all without the user needing to know "
-            "those rules exist."
+            "By the definition of an agentic system, moving beyond passively responding to a single prompt "
+            "to autonomously reason, plan across multiple steps, and use different tools to complete a real "
+            "workflow, HabaHub qualifies on each count. Reasoning: Bongo interprets ambiguous, code-switched "
+            "natural speech into structured intent, distinguishing who is speaking from who they are "
+            "referring to, and separating a completed action from a future commitment, rather than matching "
+            "against fixed commands. Planning: a single utterance triggers a different sequence of dependent "
+            "steps depending on what is actually said, not a fixed script, an admin approving a loan is "
+            "routed through pending-request lookup, eligibility verification, and term calculation, while a "
+            "member asking a clarifying question is routed through intent classification and a scoped, "
+            "role-aware answer instead. Dynamic tool use: Bongo selects among distinct tools per request, an "
+            "eligibility checker, a loan-term calculator, a payout-due verifier, a date-reference resolver, "
+            "an impersonation detector, and text-to-speech, invoking only the combination each specific "
+            "request needs. Broader goal: the objective is not answering one prompt but correctly completing "
+            "a multi-turn financial workflow spanning two users, a member's spoken loan request, human "
+            "review, admin approval, and a computed repayment schedule, tracked as one coherent, ongoing "
+            "process rather than isolated exchanges."
         )
 
     with st.expander("7. What is the technical overview?"):
@@ -1092,7 +1112,7 @@ if page == "Record & Query":
                 log_chat(speaking_as, "bongo", rephrase_msg)
                 st.write(f"**{BONGO_NAME}:**", rephrase_msg)
                 with st.spinner("Generating spoken notice..."):
-                    audio_url = generate_tts(rephrase_msg)
+                    audio_url = generate_tts(text_for_tts(rephrase_msg))
                 st.audio(audio_url)
 
             elif intent == "question":
@@ -1117,7 +1137,7 @@ if page == "Record & Query":
                 log_chat(speaking_as, "bongo", answer)
                 with st.spinner("Generating spoken answer..."):
                     t0 = time.time()
-                    audio_url = generate_tts(answer)
+                    audio_url = generate_tts(text_for_tts(answer))
                     t_tts = time.time() - t0
                 st.audio(audio_url)
                 st.caption(f"⏱️ Answer + category: {t_answer:.1f}s · TTS: {t_tts:.1f}s")
@@ -1132,7 +1152,7 @@ if page == "Record & Query":
                     log_chat(speaking_as, "bongo", flag_msg)
                     st.write(f"**{BONGO_NAME}:**", flag_msg)
                     with st.spinner("Generating spoken notice..."):
-                        audio_url = generate_tts(flag_msg)
+                        audio_url = generate_tts(text_for_tts(flag_msg))
                     st.audio(audio_url)
 
                 else:
@@ -1250,7 +1270,7 @@ if page == "Record & Query":
                             log_chat(speaking_as, "bongo", confirmation_text)
                             with st.spinner("Generating spoken confirmation..."):
                                 t0 = time.time()
-                                audio_url = generate_tts(confirmation_text)
+                                audio_url = generate_tts(text_for_tts(confirmation_text))
                                 t_tts = time.time() - t0
                             st.write("**Confirmation:**", confirmation_text)
                             st.audio(audio_url)
@@ -1282,7 +1302,7 @@ if page == "Record & Query":
                             st.session_state.loan_summary_text = summary_text
                             log_chat(speaking_as, "bongo", summary_text)
                             with st.spinner("Generating spoken summary..."):
-                                audio_url = generate_tts(summary_text)
+                                audio_url = generate_tts(text_for_tts(summary_text))
                             st.write(f"**{BONGO_NAME}:**", summary_text)
                             st.audio(audio_url)
     

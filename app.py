@@ -184,6 +184,28 @@ def clean_agent_text(text):
     return text
 
 
+def is_transcript_understandable(transcript):
+    """Checks whether the transcript is coherent English/Swahili speech that could reasonably be a real
+    request or question, versus garbled/nonsensical audio (noise, a cough, a bad transcription) that
+    should not be processed as if it were a genuine request."""
+    if not transcript or len(transcript.strip()) < 3:
+        return False
+    prompt = f"""Determine if the following transcript is coherent, understandable English and/or Swahili
+speech that could reasonably be a real request or question from a person, or if it is garbled, jumbled,
+nonsensical, or clearly not real words (e.g. from background noise, a cough, or a transcription error).
+
+Transcript: "{transcript}"
+
+Respond with ONLY valid JSON: {{"understandable": true or false}}"""
+    response = groq_client.chat.completions.create(
+        model="llama-3.1-8b-instant",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0,
+        response_format={"type": "json_object"}
+    )
+    return json.loads(response.choices[0].message.content).get("understandable", True)
+
+
 # ============================================================
 # Sahara STT / TTS
 # ============================================================
@@ -986,18 +1008,35 @@ if page == "Record & Query":
                 st.session_state.current_transcript = transcript
                 log_chat(speaking_as, "user", transcript)
 
-                with st.spinner("Understanding your message..."):
-                    t0 = time.time()
-                    intent = classify_intent(transcript)
-                    t_intent = time.time() - t0
-                st.session_state.current_intent = intent
+                with st.spinner("Checking if that was clear..."):
+                    understandable = is_transcript_understandable(transcript)
+                st.session_state.current_understandable = understandable
 
-                if intent != "question":
+                if understandable:
+                    with st.spinner("Understanding your message..."):
+                        t0 = time.time()
+                        intent = classify_intent(transcript)
+                        t_intent = time.time() - t0
+                    st.session_state.current_intent = intent
+                else:
+                    intent = None
+                    st.session_state.current_intent = None
+
+                if understandable and intent != "question":
                     with st.spinner("Extracting details..."):
                         t0 = time.time()
                         extracted_raw = extract_chama_action(transcript, speaking_as)
                         extracted = json.loads(extracted_raw) if isinstance(extracted_raw, str) else extracted_raw
                         extracted = validate_extraction(transcript, extracted)
+
+                        if IS_ADMIN and extracted.get("speaker_action") == "initiate_loan_payout" and extracted.get("referenced_member") not in ("none", ""):
+                            matching_pending = get_pending_loan_for_member(extracted["referenced_member"])
+                            if matching_pending:
+                                if extracted.get("amount") is None:
+                                    extracted["amount"] = matching_pending["amount"]
+                                if extracted.get("loan_duration_months") is None:
+                                    extracted["loan_duration_months"] = matching_pending.get("suggested_duration_months", 4)
+
                         t_extract = time.time() - t0
                     st.session_state.current_extracted = extracted
                     st.caption(f"⏱️ STT: {t_stt:.1f}s · intent: {t_intent:.1f}s · extraction: {t_extract:.1f}s")
@@ -1017,7 +1056,7 @@ if page == "Record & Query":
                                 "reason": imp_check.get("reason", ""),
                                 "status": "unreviewed"
                             })
-                else:
+                elif understandable:
                     st.caption(f"⏱️ STT: {t_stt:.1f}s · intent: {t_intent:.1f}s")
 
             transcript = st.session_state.current_transcript
@@ -1035,7 +1074,18 @@ if page == "Record & Query":
                     })
                     st.success(f"✅ Saved as testcase{sample_index}. View and download it on the Benchmark Data page.")
 
-            if intent == "question":
+            if not st.session_state.get("current_understandable", True):
+                st.warning("🤔 That wasn't clear enough to process.")
+                rephrase_msg = clean_agent_text(
+                    "I could not understand that clearly. Could you please rephrase your request in English or Swahili?"
+                )
+                log_chat(speaking_as, "bongo", rephrase_msg)
+                st.write(f"**{BONGO_NAME}:**", rephrase_msg)
+                with st.spinner("Generating spoken notice..."):
+                    audio_url = generate_tts(rephrase_msg)
+                st.audio(audio_url)
+
+            elif intent == "question":
                 with st.spinner("Checking records..."):
                     t0 = time.time()
                     category = classify_query_category(transcript)
@@ -1154,22 +1204,20 @@ if page == "Record & Query":
                             if edited_speaker_action == "initiate_loan_payout" and IS_ADMIN and edited_referenced_member not in ("none", ""):
                                 ai_action_taken = True
                                 pending_loan = get_pending_loan_for_member(edited_referenced_member)
-                                spoken_duration = extracted.get("loan_duration_months")
                                 if not pending_loan:
                                     st.error(f"❌ No pending loan request found for {edited_referenced_member}.")
                                     confirmation_text += f" No pending loan request found for {edited_referenced_member}."
-                                elif not spoken_duration:
-                                    st.error("❌ Please state the loan duration in months (e.g. 'kwa miezi sita') before approving.")
-                                    confirmation_text += " Please state the loan duration in months before approving."
                                 else:
+                                    spoken_duration = extracted.get("loan_duration_months")
+                                    effective_duration = spoken_duration or pending_loan.get("suggested_duration_months", 4)
                                     eligible, elig_message = check_loan_eligibility(edited_referenced_member, pending_loan["amount"], viewer=speaking_as)
                                     idx = st.session_state.loan_requests.index(pending_loan)
                                     if eligible:
-                                        terms = calculate_loan_terms(pending_loan["amount"], spoken_duration)
+                                        terms = calculate_loan_terms(pending_loan["amount"], effective_duration)
                                         st.session_state.loan_requests[idx]["status"] = "approved"
                                         st.session_state.loan_requests[idx].update(terms)
-                                        st.success(f"✅ SIMULATED LOAN PAYMENT, {elig_message} Monthly payment: {terms['monthly_payment']} over {spoken_duration} months.")
-                                        confirmation_text += f" Loan payout of {pending_loan['amount']} approved over {spoken_duration} months. Monthly payment: {terms['monthly_payment']}."
+                                        st.success(f"✅ SIMULATED LOAN PAYMENT, {elig_message} Monthly payment: {terms['monthly_payment']} over {effective_duration} months.")
+                                        confirmation_text += f" Loan payout of {pending_loan['amount']} approved over {effective_duration} months. Monthly payment: {terms['monthly_payment']}."
                                     else:
                                         st.error(f"❌ Loan payout blocked, {elig_message}")
                                         confirmation_text += f" Loan payout blocked. {elig_message}"

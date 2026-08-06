@@ -173,12 +173,12 @@ Respond with ONLY valid JSON: {{"impersonation_detected": true or false, "claime
 
 
 def clean_agent_text(text):
-    """Strips punctuation from Bongo's spoken/displayed replies, per instruction, while preserving
-    decimal points inside numbers (e.g. 2160.50 stays intact) and collapsing extra whitespace left behind."""
+    """Strips punctuation from Bongo's spoken/displayed replies, while preserving sentence-ending periods
+    (so multi-sentence answers stay readable) and decimal points inside numbers (e.g. 2160.50 stays intact)."""
     if not text:
         return text
     text = text.replace("—", " ")
-    text = re.sub(r'(?<!\d)[.](?!\d)', '', text)
+    text = re.sub(r'(?<!\d)[.](?!\d)(?!\s|$)', '', text)
     text = re.sub(r'[,;:!?"\'()]', '', text)
     text = re.sub(r'\s+', ' ', text).strip()
     return text
